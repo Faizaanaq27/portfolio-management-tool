@@ -62,11 +62,6 @@ def _clean_str(x) -> str:
     return str(x).strip() if x is not None else ""
 
 
-def _ensure_date(x):
-    d = pd.to_datetime(x, errors="coerce")
-    return d
-
-
 def load_portfolios() -> pd.DataFrame:
     try:
         df = pd.read_csv(PORTFOLIO_PATH)
@@ -89,12 +84,22 @@ def load_portfolios() -> pd.DataFrame:
 
     # Default portfolio
     if "Main" not in set(df["portfolio"].tolist()):
-        df = pd.concat([pd.DataFrame([{
-            "portfolio": "Main",
-            "start_mode": "ledger_complete",
-            "as_of_date": pd.to_datetime(date.today()),
-            "starting_cash": 0.0
-        }]), df], ignore_index=True)
+        df = pd.concat(
+            [
+                pd.DataFrame(
+                    [
+                        {
+                            "portfolio": "Main",
+                            "start_mode": "ledger_complete",
+                            "as_of_date": pd.to_datetime(date.today()),
+                            "starting_cash": 0.0,
+                        }
+                    ]
+                ),
+                df,
+            ],
+            ignore_index=True,
+        )
 
     # If as_of_date missing, default to today
     df.loc[df["as_of_date"].isna(), "as_of_date"] = pd.to_datetime(date.today())
@@ -220,7 +225,7 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
 def apply_sell_to_lots(lots: list[dict], sell_shares: float, method: str):
     """
     Mutates lots in-place (each lot has shares_open, buy_price, buy_date, lot_id, ticker).
-    Returns list of realized match rows.
+    Returns list of realized match rows: (lot, shares_sold).
     """
     realized_rows = []
     remaining = sell_shares
@@ -249,25 +254,27 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
     open_cols = ["lot_id", "ticker", "buy_date", "buy_price", "shares_open"]
     real_cols = ["sale_id", "ticker", "buy_date", "buy_price", "sell_date", "sell_price", "shares_sold", "pnl"]
 
-    # Starting lots from baseline
     lots_by_ticker = {}
+
+    # Starting lots from baseline
     if not baseline.empty:
         for _, r in baseline.iterrows():
             t = str(r["ticker"]).upper().strip()
-            lots_by_ticker.setdefault(t, []).append({
-                "lot_id": str(r["lot_id"]),
-                "ticker": t,
-                "buy_date": pd.to_datetime(r["buy_date"]).date(),
-                "buy_price": float(r["buy_price"]),
-                "shares_open": float(r["shares_open"]),
-            })
+            lots_by_ticker.setdefault(t, []).append(
+                {
+                    "lot_id": str(r["lot_id"]),
+                    "ticker": t,
+                    "buy_date": pd.to_datetime(r["buy_date"]).date(),
+                    "buy_price": float(r["buy_price"]),
+                    "shares_open": float(r["shares_open"]),
+                }
+            )
 
     realized = []
 
     if trades.empty:
-        # only baseline
         open_lots = []
-        for t, lots in lots_by_ticker.items():
+        for _, lots in lots_by_ticker.items():
             open_lots.extend([x for x in lots if x["shares_open"] > 1e-12])
         return pd.DataFrame(open_lots, columns=open_cols), pd.DataFrame(columns=real_cols)
 
@@ -277,13 +284,15 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
         tkr = str(r["ticker"]).upper().strip()
 
         if typ == "buy":
-            lots_by_ticker.setdefault(tkr, []).append({
-                "lot_id": str(r["txn_id"]),
-                "ticker": tkr,
-                "buy_date": pd.to_datetime(r["date"]).date(),
-                "buy_price": float(r["price"]),
-                "shares_open": float(r["shares"]),
-            })
+            lots_by_ticker.setdefault(tkr, []).append(
+                {
+                    "lot_id": str(r["txn_id"]),
+                    "ticker": tkr,
+                    "buy_date": pd.to_datetime(r["date"]).date(),
+                    "buy_price": float(r["price"]),
+                    "shares_open": float(r["shares"]),
+                }
+            )
 
         elif typ == "sell":
             sell_shares = float(r["shares"])
@@ -296,19 +305,21 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
 
             for lot, shares_sold in matches:
                 pnl = shares_sold * (sell_price - float(lot["buy_price"]))
-                realized.append({
-                    "sale_id": sale_id,
-                    "ticker": tkr,
-                    "buy_date": lot["buy_date"],
-                    "buy_price": float(lot["buy_price"]),
-                    "sell_date": sell_date,
-                    "sell_price": sell_price,
-                    "shares_sold": shares_sold,
-                    "pnl": pnl,
-                })
+                realized.append(
+                    {
+                        "sale_id": sale_id,
+                        "ticker": tkr,
+                        "buy_date": lot["buy_date"],
+                        "buy_price": float(lot["buy_price"]),
+                        "sell_date": sell_date,
+                        "sell_price": sell_price,
+                        "shares_sold": shares_sold,
+                        "pnl": pnl,
+                    }
+                )
 
     open_lots = []
-    for t, lots in lots_by_ticker.items():
+    for _, lots in lots_by_ticker.items():
         open_lots.extend([x for x in lots if x["shares_open"] > 1e-12])
 
     return pd.DataFrame(open_lots, columns=open_cols), pd.DataFrame(realized, columns=real_cols)
@@ -367,12 +378,11 @@ def validate_candidate_state(
         if cash < -1e-9:
             return False, "Invalid: cash would go negative (margin not allowed)."
 
-    # Share constraint: simulate lots inventory (baseline + buys/sells)
+    # Share constraint: baseline + buys - sells
     trades = txns[txns["type"].isin(["buy", "sell"])].copy()
     if trades.empty:
         return True, ""
 
-    # Build an inventory view just to see if any sell exceeds available shares
     inv = {}
     if not portfolio_baseline.empty:
         for _, r in portfolio_baseline.iterrows():
@@ -400,14 +410,15 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
     start_mode = portfolio_meta["start_mode"]
     starting_cash = float(portfolio_meta["starting_cash"])
 
-    # For snapshot portfolios, only consider baseline and txns on/after as_of
     df = txns.copy()
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"])
+
+    # For snapshot portfolios, only consider txns on/after as_of
     if start_mode == "snapshot_start" and not df.empty:
         df = df[df["date"] >= as_of].copy()
 
-    # Cash
+    # Cash (baseline lots do not affect cash)
     cash_now = starting_cash + (df.apply(cash_delta, axis=1).sum() if not df.empty else 0.0)
 
     # Lots and realized from trades + baseline
@@ -429,7 +440,6 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
             np.nan,
         )
 
-        # holdings summary
         tmp = lots_view.copy()
         tmp["cost_dollars"] = tmp["shares_open"] * tmp["buy_price"]
         holdings = tmp.groupby("ticker", as_index=False).agg(
@@ -440,7 +450,6 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
         )
         holdings["avg_cost"] = np.where(holdings["shares"] > 0, holdings["cost_dollars"] / holdings["shares"], np.nan)
         holdings = holdings.sort_values("market_value", ascending=False)
-
     else:
         lots_view = open_lots
         holdings = pd.DataFrame()
@@ -467,29 +476,37 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 
 
 # =========================
-# 4) UI
+# 4) Load data + reconcile
 # =========================
 portfolios_df = load_portfolios()
 txns_all = load_txns()
 baseline_all = load_baseline()
 
-# ensure portfolios referenced by txns exist
+# Ensure portfolios referenced by txns exist
 if not txns_all.empty:
     existing = set(portfolios_df["portfolio"].tolist())
     found = set(txns_all["portfolio"].astype(str).str.strip().tolist())
     missing = sorted([p for p in found if p and p not in existing])
     if missing:
-        add = pd.DataFrame([{
-            "portfolio": p,
-            "start_mode": "ledger_complete",
-            "as_of_date": pd.to_datetime(date.today()),
-            "starting_cash": 0.0
-        } for p in missing])
+        add = pd.DataFrame(
+            [
+                {
+                    "portfolio": p,
+                    "start_mode": "ledger_complete",
+                    "as_of_date": pd.to_datetime(date.today()),
+                    "starting_cash": 0.0,
+                }
+                for p in missing
+            ]
+        )
         portfolios_df = pd.concat([portfolios_df, add], ignore_index=True)
         save_portfolios(portfolios_df)
 
 portfolio_names = portfolios_df["portfolio"].tolist()
 
+# =========================
+# 5) UI
+# =========================
 st.title("Manual Portfolio Tracker")
 st.caption("Public view is read-only. Admin can edit and create portfolios, baseline lots, and transactions.")
 
@@ -500,6 +517,7 @@ match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
 st.subheader("Public View (read-only)")
 tabs = st.tabs(portfolio_names)
 
+
 def render_public_portfolio(pname: str):
     meta = get_portfolio_meta(portfolios_df, pname)
     p_txns = txns_all[txns_all["portfolio"] == pname].copy()
@@ -507,9 +525,11 @@ def render_public_portfolio(pname: str):
 
     snap = portfolio_snapshot(meta, p_txns, p_base, match_method)
 
-    # top banner explaining boundary
     if snap["start_mode"] == "snapshot_start":
-        st.info(f"Snapshot portfolio — tracking boundary starts {snap['as_of'].date()}. Baseline lots represent holdings as of that date.")
+        st.info(
+            f"Snapshot portfolio — tracking boundary starts {snap['as_of'].date()}. "
+            f"Baseline lots represent holdings as of that date."
+        )
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
 
@@ -547,80 +567,104 @@ def render_public_portfolio(pname: str):
     else:
         st.dataframe(snap["filtered_txns"], use_container_width=True)
 
+
 for i, p in enumerate(portfolio_names):
     with tabs[i]:
         st.markdown(f"## {p}")
         render_public_portfolio(p)
 
-# ---------- Admin section ----------
+# ---------- Admin section (REFINED UI) ----------
 if is_admin:
     st.markdown("---")
-    st.subheader("Admin (edit enabled)")
+    st.header("Admin")
 
-    left, right = st.columns([1, 2])
+    # One selector for the whole admin area
+    active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
+    meta = get_portfolio_meta(portfolios_df, active)
 
-    # ---- Portfolio management ----
-    with left:
-        st.markdown("### Create portfolio")
-        new_name = st.text_input("Name", value="", placeholder="e.g., Long Only, Trading, IRA")
-        new_mode = st.selectbox("Start mode", VALID_MODES, index=0)
-        new_asof = st.date_input("As-of date", value=date.today())
-        new_cash = st.number_input("Starting cash ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
+    admin_tabs = st.tabs(["Portfolios", "Baseline lots", "Transactions"])
 
-        if st.button("Add portfolio", type="primary"):
+    # -----------------------
+    # Portfolios tab
+    # -----------------------
+    with admin_tabs[0]:
+        st.subheader("Create portfolio")
+        with st.form("create_portfolio_form", clear_on_submit=True):
+            new_name = st.text_input("Name", placeholder="e.g., Long Only, Trading, IRA")
+            new_mode = st.selectbox("Start mode", VALID_MODES, index=0)
+            new_asof = st.date_input("As-of date", value=date.today())
+            new_cash = st.number_input("Starting cash ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
+            submitted = st.form_submit_button("Add portfolio")
+
+        if submitted:
             name = _clean_str(new_name)
             if not name:
                 st.error("Enter a portfolio name.")
             elif name in set(portfolio_names):
                 st.warning("That portfolio already exists.")
             else:
-                portfolios_df = pd.concat([portfolios_df, pd.DataFrame([{
-                    "portfolio": name,
-                    "start_mode": new_mode,
-                    "as_of_date": pd.to_datetime(new_asof),
-                    "starting_cash": float(new_cash),
-                }])], ignore_index=True)
+                portfolios_df = pd.concat(
+                    [
+                        portfolios_df,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "portfolio": name,
+                                    "start_mode": new_mode,
+                                    "as_of_date": pd.to_datetime(new_asof),
+                                    "starting_cash": float(new_cash),
+                                }
+                            ]
+                        ),
+                    ],
+                    ignore_index=True,
+                )
                 save_portfolios(portfolios_df)
                 st.success("Portfolio added.")
                 st.rerun()
 
-        st.markdown("---")
-        st.markdown("### Edit portfolio settings")
-        p_sel = st.selectbox("Portfolio", portfolio_names, index=0, key="p_edit")
-        meta = get_portfolio_meta(portfolios_df, p_sel)
+        st.divider()
+        st.subheader(f"Edit settings: {active}")
 
-        mode_u = st.selectbox("Start mode", VALID_MODES, index=VALID_MODES.index(meta["start_mode"]), key="mode_u")
-        asof_u = st.date_input("As-of date", value=meta["as_of_date"].date(), key="asof_u")
-        cash_u = st.number_input("Starting cash ($)", min_value=0.0, value=float(meta["starting_cash"]), step=100.0, format="%.2f", key="cash_u")
+        with st.form("edit_portfolio_form"):
+            mode_u = st.selectbox("Start mode", VALID_MODES, index=VALID_MODES.index(meta["start_mode"]))
+            asof_u = st.date_input("As-of date", value=meta["as_of_date"].date())
+            cash_u = st.number_input(
+                "Starting cash ($)", min_value=0.0, value=float(meta["starting_cash"]), step=100.0, format="%.2f"
+            )
+            saved = st.form_submit_button("Save settings")
 
-        if st.button("Save portfolio settings"):
-            portfolios_df.loc[portfolios_df["portfolio"] == p_sel, "start_mode"] = mode_u
-            portfolios_df.loc[portfolios_df["portfolio"] == p_sel, "as_of_date"] = pd.to_datetime(asof_u)
-            portfolios_df.loc[portfolios_df["portfolio"] == p_sel, "starting_cash"] = float(cash_u)
+        if saved:
+            portfolios_df.loc[portfolios_df["portfolio"] == active, "start_mode"] = mode_u
+            portfolios_df.loc[portfolios_df["portfolio"] == active, "as_of_date"] = pd.to_datetime(asof_u)
+            portfolios_df.loc[portfolios_df["portfolio"] == active, "starting_cash"] = float(cash_u)
             save_portfolios(portfolios_df)
             st.success("Saved.")
             st.rerun()
 
-    # ---- Baseline lots + transactions ----
-    with right:
-        st.markdown("### Edit data")
-        active = st.selectbox("Active portfolio", portfolio_names, index=0, key="active_portfolio")
-        meta = get_portfolio_meta(portfolios_df, active)
+    # -----------------------
+    # Baseline lots tab
+    # -----------------------
+    with admin_tabs[1]:
+        st.subheader("Baseline lots (snapshot portfolios only)")
 
-        # Baseline lots only meaningful for snapshot portfolios
-        if meta["start_mode"] == "snapshot_start":
-            st.markdown("#### Baseline lots (snapshot holdings)")
-            b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
-            with b1:
-                bl_ticker = st.text_input("Ticker", value="AAPL", key="bl_ticker")
-            with b2:
-                bl_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f", key="bl_shares")
-            with b3:
-                bl_price = st.number_input("Cost basis (price)", min_value=0.0, value=100.00, step=0.01, format="%.2f", key="bl_price")
-            with b4:
-                bl_date = st.date_input("Acquisition date", value=date.today(), key="bl_date")
+        if meta["start_mode"] != "snapshot_start":
+            st.info("This portfolio is ledger-complete. Baseline lots are only used for snapshot-start portfolios.")
+        else:
+            with st.form("add_baseline_form", clear_on_submit=True):
+                c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+                with c1:
+                    bl_ticker = st.text_input("Ticker", value="AAPL")
+                with c2:
+                    bl_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
+                with c3:
+                    bl_price = st.number_input("Cost basis (price)", min_value=0.0, value=100.00, step=0.01, format="%.2f")
+                with c4:
+                    bl_date = st.date_input("Acquisition date", value=date.today())
 
-            if st.button("Add baseline lot", type="primary"):
+                add_bl = st.form_submit_button("Add baseline lot")
+
+            if add_bl:
                 row = {
                     "lot_id": str(pd.Timestamp.utcnow().value),
                     "portfolio": active,
@@ -629,59 +673,72 @@ if is_admin:
                     "buy_price": float(bl_price),
                     "shares_open": float(round(bl_shares, 3)),
                 }
-                candidate = pd.concat([baseline_all, pd.DataFrame([row])], ignore_index=True)
-                baseline_all = candidate
+                baseline_all = pd.concat([baseline_all, pd.DataFrame([row])], ignore_index=True)
                 save_baseline(baseline_all)
                 st.success("Baseline lot added.")
                 st.rerun()
 
-            # baseline table + delete
+            st.divider()
+            st.write("Current baseline lots")
             p_base = baseline_all[baseline_all["portfolio"] == active].copy()
+
             if p_base.empty:
                 st.info("No baseline lots yet.")
             else:
                 st.dataframe(p_base.sort_values(["ticker", "buy_date"]), use_container_width=True)
+
                 p_base_disp = p_base.copy()
                 p_base_disp["display"] = (
                     pd.to_datetime(p_base_disp["buy_date"]).dt.date.astype(str)
-                    + " | " + p_base_disp["ticker"]
-                    + " | " + p_base_disp["shares_open"].map(lambda x: f"{x:.3f}")
-                    + " @ " + p_base_disp["buy_price"].map(lambda x: f"{x:.2f}")
-                    + " | id=" + p_base_disp["lot_id"].astype(str)
+                    + " | "
+                    + p_base_disp["ticker"]
+                    + " | "
+                    + p_base_disp["shares_open"].map(lambda x: f"{x:.3f}")
+                    + " @ "
+                    + p_base_disp["buy_price"].map(lambda x: f"{x:.2f}")
+                    + " | id="
+                    + p_base_disp["lot_id"].astype(str)
                 )
-                choice = st.selectbox("Select baseline lot to delete", p_base_disp["display"].tolist(), key="del_base_choice")
+                choice = st.selectbox("Select baseline lot to delete", p_base_disp["display"].tolist())
                 chosen_id = choice.split("id=")[-1].strip()
+
                 if st.button("Delete baseline lot"):
                     baseline_all = baseline_all[baseline_all["lot_id"].astype(str) != chosen_id].copy()
                     save_baseline(baseline_all)
                     st.warning("Deleted baseline lot.")
                     st.rerun()
 
-            st.markdown("---")
+    # -----------------------
+    # Transactions tab
+    # -----------------------
+    with admin_tabs[2]:
+        st.subheader("Transactions")
 
-        st.markdown("#### Add transaction (buy/sell/dividend)")
-        txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0, key="t_type")
-        t_date = st.date_input("Date", value=date.today(), key="t_date")
+        with st.form("add_txn_form", clear_on_submit=True):
+            txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0)
+            t_date = st.date_input("Date", value=date.today())
 
-        if txn_type in ["buy", "sell"]:
-            c1, c2, c3 = st.columns([1, 1, 1])
-            with c1:
-                t_ticker = st.text_input("Ticker", value="AAPL", key="t_ticker")
-            with c2:
-                t_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f", key="t_shares")
-            with c3:
-                t_price = st.number_input("Price", min_value=0.0, value=100.00, step=0.01, format="%.2f", key="t_price")
-            t_amount = np.nan
-        else:
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                t_ticker = st.text_input("Ticker (optional)", value="", key="d_ticker")
-            with c2:
-                t_amount = st.number_input("Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f", key="d_amount")
-            t_shares = np.nan
-            t_price = np.nan
+            if txn_type in ["buy", "sell"]:
+                c1, c2, c3 = st.columns([1, 1, 1])
+                with c1:
+                    t_ticker = st.text_input("Ticker", value="AAPL")
+                with c2:
+                    t_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
+                with c3:
+                    t_price = st.number_input("Price", min_value=0.0, value=100.00, step=0.01, format="%.2f")
+                t_amount = np.nan
+            else:
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    t_ticker = st.text_input("Ticker (optional)", value="")
+                with c2:
+                    t_amount = st.number_input("Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+                t_shares = np.nan
+                t_price = np.nan
 
-        if st.button("Save transaction", type="primary"):
+            add_txn = st.form_submit_button("Save transaction")
+
+        if add_txn:
             row = {
                 "txn_id": str(pd.Timestamp.utcnow().value),
                 "portfolio": active,
@@ -694,7 +751,6 @@ if is_admin:
             }
 
             candidate_txns = pd.concat([txns_all, pd.DataFrame([row])], ignore_index=True)
-
             p_txns = candidate_txns[candidate_txns["portfolio"] == active].copy()
             p_base = baseline_all[baseline_all["portfolio"] == active].copy()
 
@@ -707,8 +763,9 @@ if is_admin:
                 st.success("Saved.")
                 st.rerun()
 
-        st.markdown("---")
-        st.markdown("#### Delete transaction")
+        st.divider()
+        st.subheader("Delete transaction")
+
         p_txns = txns_all[txns_all["portfolio"] == active].copy()
         if p_txns.empty:
             st.info("No transactions.")
@@ -717,9 +774,20 @@ if is_admin:
             disp["date_str"] = pd.to_datetime(disp["date"]).dt.date.astype(str)
             disp["desc"] = np.where(
                 disp["type"].isin(["buy", "sell"]),
-                disp["date_str"] + " | " + disp["type"] + " | " + disp["ticker"] + " | "
-                + disp["shares"].map(lambda x: f"{x:.3f}") + " @ " + disp["price"].map(lambda x: f"{x:.2f}"),
-                disp["date_str"] + " | dividend | " + disp["ticker"].fillna("").astype(str) + " | $" + disp["amount"].map(lambda x: f"{x:.2f}")
+                disp["date_str"]
+                + " | "
+                + disp["type"]
+                + " | "
+                + disp["ticker"]
+                + " | "
+                + disp["shares"].map(lambda x: f"{x:.3f}")
+                + " @ "
+                + disp["price"].map(lambda x: f"{x:.2f}"),
+                disp["date_str"]
+                + " | dividend | "
+                + disp["ticker"].fillna("").astype(str)
+                + " | $"
+                + disp["amount"].map(lambda x: f"{x:.2f}"),
             )
             disp["display"] = disp["desc"] + " | id=" + disp["txn_id"].astype(str)
 
@@ -741,4 +809,7 @@ if is_admin:
                     st.warning("Deleted.")
                     st.rerun()
 
-st.caption("Files used: portfolios.csv, baseline_lots.csv, transactions.csv. Snapshot portfolios track from as-of date forward; baseline lots represent holdings at the boundary.")
+st.caption(
+    "Files used: portfolios.csv, baseline_lots.csv, transactions.csv. "
+    "Snapshot portfolios track from as-of date forward; baseline lots represent holdings at the boundary."
+)
