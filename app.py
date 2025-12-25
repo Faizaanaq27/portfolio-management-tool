@@ -45,6 +45,8 @@ with st.sidebar:
         st.session_state.is_admin = False
         st.rerun()
 
+st.sidebar.image("biglogo-white.png", use_container_width=True)
+
 # =========================
 # 2) Storage (CSV)
 # =========================
@@ -513,7 +515,6 @@ portfolio_names = portfolios_df["portfolio"].tolist()
 # 5) UI
 # =========================
 
-st.image(str(LOGO_PATH), width=220)
 st.title("Brown Investment Group Portfolio")
 st.caption("Welcome.")
 
