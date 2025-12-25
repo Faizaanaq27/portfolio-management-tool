@@ -472,10 +472,21 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 
 
 # =========================
-# 4) Chart helpers (NAV series)
+# 4) Chart helpers (WEEKLY or DAILY)
 # =========================
 def _portfolio_start_date(meta: dict) -> pd.Timestamp:
     return pd.to_datetime(meta["as_of_date"]).normalize()
+
+
+def index_to_100(series: pd.Series) -> pd.Series:
+    s = series.copy()
+    first = s.first_valid_index()
+    if first is None:
+        return s
+    base = float(s.loc[first])
+    if base == 0:
+        return s
+    return (s / base) * 100.0
 
 
 def compute_nav_series_for_portfolio(
@@ -484,32 +495,45 @@ def compute_nav_series_for_portfolio(
     txns_all: pd.DataFrame,
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
+    chart_freq: str,  # "D" or "W-MON"
 ) -> pd.Series:
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
+    # Portfolio txns
     txns = txns_all[txns_all["portfolio"] == pname].copy()
     if not txns.empty:
         txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
         txns = txns.sort_values(["date", "txn_id"])
         txns = txns[txns["date"] >= start].copy()
 
+    # Portfolio baseline
     baseline = baseline_all[baseline_all["portfolio"] == pname].copy()
     if not baseline.empty:
         baseline["ticker"] = baseline["ticker"].astype(str).str.upper().str.strip()
 
-    idx = pd.date_range(start=start, end=end, freq="D")
+    # Build index
+    idx = pd.date_range(start=start, end=end, freq=chart_freq)
 
-    # Cash series
+    # ---- Cash series ----
     starting_cash = float(meta["starting_cash"])
-    cash_flow = pd.Series(0.0, index=idx)
-    if not txns.empty:
+
+    if txns.empty:
+        cash = pd.Series(starting_cash, index=idx)
+    else:
         cf = txns.apply(cash_delta, axis=1)
         cf_by_day = cf.groupby(txns["date"]).sum()
-        cash_flow.loc[cf_by_day.index.intersection(idx)] = cf_by_day.reindex(idx, fill_value=0.0)
-    cash = starting_cash + cash_flow.cumsum()
 
-    # Shares series
+        if chart_freq == "D":
+            cash_flow = cf_by_day.reindex(idx, fill_value=0.0)
+        else:
+            # Bucket into week-start (Mondays)
+            cf_week = cf_by_day.groupby(pd.Grouper(freq="W-MON")).sum()
+            cash_flow = cf_week.reindex(idx, fill_value=0.0)
+
+        cash = starting_cash + cash_flow.cumsum()
+
+    # ---- Shares series ----
     baseline_shares = {}
     if not baseline.empty:
         for _, r in baseline.iterrows():
@@ -522,9 +546,7 @@ def compute_nav_series_for_portfolio(
     if not trades.empty:
         trades["ticker"] = trades["ticker"].astype(str).str.upper().str.strip()
         trades["signed_shares"] = np.where(trades["type"] == "buy", trades["shares"], -trades["shares"])
-        for t in trades["ticker"].unique():
-            if t:
-                tickers.add(t)
+        tickers.update([t for t in trades["ticker"].unique() if t])
 
     tickers = sorted([t for t in tickers if t])
     if not tickers:
@@ -534,9 +556,9 @@ def compute_nav_series_for_portfolio(
 
     shares_df = pd.DataFrame(0.0, index=idx, columns=tickers)
 
-    # Baseline injection at start
+    # Baseline injection at start index point
     for t, sh in baseline_shares.items():
-        if t in shares_df.columns:
+        if t in shares_df.columns and len(idx) > 0:
             shares_df.loc[idx[0], t] += sh
 
     if not trades.empty:
@@ -544,33 +566,34 @@ def compute_nav_series_for_portfolio(
             t_tr = trades[trades["ticker"] == t]
             if t_tr.empty:
                 continue
+
             delta_by_day = t_tr.groupby("date")["signed_shares"].sum()
-            shares_df.loc[delta_by_day.index.intersection(idx), t] += delta_by_day.reindex(idx, fill_value=0.0)
+
+            if chart_freq == "D":
+                delta_bucketed = delta_by_day.reindex(idx, fill_value=0.0)
+                shares_df[t] += delta_bucketed
+            else:
+                delta_week = delta_by_day.groupby(pd.Grouper(freq="W-MON")).sum()
+                shares_df[t] += delta_week.reindex(idx, fill_value=0.0)
 
     shares_df = shares_df.cumsum()
 
-    px = fetch_price_history(tickers, start, end)
-    if px.empty:
+    # ---- Prices & NAV ----
+    px_daily = fetch_price_history(tickers, start, end)
+    if px_daily.empty:
         nav = cash.copy()
         nav.name = pname
         return nav
 
-    px = px.reindex(idx).ffill()
+    # Reindex daily first, then snap to chart idx
+    daily_idx = pd.date_range(start=start, end=end, freq="D")
+    px_daily = px_daily.reindex(daily_idx).ffill()
+    px = px_daily.reindex(idx).ffill()
+
     mv = (shares_df * px[tickers]).sum(axis=1)
     nav = cash + mv
     nav.name = pname
     return nav
-
-
-def index_to_100(series: pd.Series) -> pd.Series:
-    s = series.copy()
-    first = s.first_valid_index()
-    if first is None:
-        return s
-    base = float(s.loc[first])
-    if base == 0:
-        return s
-    return (s / base) * 100.0
 
 
 # =========================
@@ -607,12 +630,14 @@ portfolio_names = portfolios_df["portfolio"].tolist()
 st.title("Brown Investment Group Portfolio")
 st.caption("Public view is read-only. Admin can edit portfolios, baseline lots, and transactions.")
 
-st.sidebar.header("Lot settings")
+st.sidebar.header("Settings")
 match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
+
+freq_choice = st.sidebar.selectbox("Chart frequency", ["Weekly (Mon)", "Daily"], index=0)
+chart_freq = "W-MON" if freq_choice.startswith("Weekly") else "D"
 
 # ---------- Public view ----------
 st.subheader("Public View (read-only)")
-
 public_tabs = st.tabs(["Overview"] + portfolio_names)
 
 
@@ -677,7 +702,6 @@ with public_tabs[0]:
     cash_now_by_port = {}
     pnl_now_by_port = {}
 
-    # Snapshot metrics + NAV series
     for p in portfolio_names:
         meta = get_portfolio_meta(portfolios_df, p)
         p_txns = txns_all[txns_all["portfolio"] == p].copy()
@@ -693,6 +717,7 @@ with public_tabs[0]:
             txns_all=txns_all,
             baseline_all=baseline_all,
             end_date=end_date,
+            chart_freq=chart_freq,
         )
 
     nav_df = pd.DataFrame(nav_series).sort_index()
@@ -710,7 +735,7 @@ with public_tabs[0]:
 
     st.divider()
 
-    # Relative performance (indexed) + SPY baseline
+    # Relative performance + SPY
     earliest = None
     for s in nav_series.values():
         fv = s.first_valid_index()
@@ -720,10 +745,15 @@ with public_tabs[0]:
     if earliest is None or nav_df.empty:
         st.info("Add at least one portfolio with data to see charts.")
     else:
-        # SPY baseline on same date index
         spy_px = fetch_price_history(["SPY"], earliest, end_date)
         if not spy_px.empty:
-            spy = spy_px["SPY"].reindex(nav_df.index).ffill()
+            spy_daily = spy_px["SPY"].copy()
+            # snap SPY to chart index:
+            if chart_freq == "D":
+                spy = spy_daily.reindex(nav_df.index).ffill()
+            else:
+                spy = spy_daily.reindex(pd.date_range(earliest, end_date, freq="D")).ffill()
+                spy = spy.reindex(nav_df.index).ffill()
             spy = index_to_100(spy)
         else:
             spy = pd.Series(index=nav_df.index, dtype=float)
@@ -731,15 +761,15 @@ with public_tabs[0]:
         rel = pd.DataFrame({p: index_to_100(nav_df[p]) for p in nav_df.columns})
         rel["SPY"] = spy
 
-        st.markdown("### Relative performance (Indexed to 100 at series start)")
+        st.markdown(f"### Relative performance (Indexed to 100 at series start) — {freq_choice}")
         st.line_chart(rel)
 
-        st.markdown("### Aggregate growth (Indexed)")
+        st.markdown(f"### Aggregate growth (Indexed) — {freq_choice}")
         st.line_chart(index_to_100(agg_nav))
 
     st.divider()
 
-    # Portfolio grid: columns = number of portfolios
+    # Portfolio grid
     st.markdown("## Portfolios")
     if not portfolio_names:
         st.write("No portfolios yet.")
@@ -1037,53 +1067,9 @@ if is_admin:
 
 ---
 
-### What each concept means
-
-#### Start mode
-- **`ledger_complete`**
-  - You have the full transaction history.
-  - The app computes cash, lots, realized/unrealized P&L from the start of your ledger.
-
-- **`snapshot_start`**
-  - You don’t have full history.
-  - You define a “starting state” at the **As-of date** using:
-    - Starting cash
-    - Baseline lots (holdings)
-  - The app tracks performance accurately **from the as-of date forward**.
-
-#### As-of date
-- The boundary date for snapshot portfolios.
-- In `snapshot_start`, transactions **before** this date are blocked.
-
-#### Starting cash
-- Cash balance **at the as-of date**.
-- Updates automatically from:
-  - **Buy** → cash decreases
-  - **Sell** → cash increases
-  - **Dividend** → cash increases
-
-#### Baseline lots
-- Used only for `snapshot_start`.
-- Represents positions that existed on the as-of date.
-- Affects **shares owned** and **P&L**, but does **not** change cash.
-
----
-
-### Transactions
-
-#### Buy
-- Creates a new lot at (date, price, shares)
-- Cash decreases by `shares * price`
-
-#### Sell
-- Closes lots using FIFO or LIFO
-- Cash increases by `shares * price`
-- Realized P&L = `(sell_price - buy_price) * shares_sold`
-- The app blocks selling more shares than you own.
-
-#### Dividend
-- Cash increases immediately by the dividend amount
-- Cash-only event (no lots)
+### Charting notes
+- Your charts start at the portfolio **As-of date** by design (no line before start date).
+- If you want a longer chart, set the portfolio **As-of date** earlier (or enter history).
 
 ---
 
