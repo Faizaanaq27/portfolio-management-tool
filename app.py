@@ -911,4 +911,191 @@ if is_admin:
                     "buy_price": float(bl_price),
                     "shares_open": float(round(bl_shares, 3)),
                 }
-                baseline_all = pd.concat([baseline_all, pd
+                baseline_all = pd.concat([baseline_all, pd.DataFrame([row])], ignore_index=True)
+                save_baseline(baseline_all)
+                st.success("Baseline lot added.")
+                st.rerun()
+
+            st.divider()
+            st.write("Current baseline lots")
+            p_base = baseline_all[baseline_all["portfolio"] == active].copy()
+
+            if p_base.empty:
+                st.info("No baseline lots yet.")
+            else:
+                st.dataframe(p_base.sort_values(["ticker", "buy_date"]), use_container_width=True)
+
+                p_base_disp = p_base.copy()
+                p_base_disp["display"] = (
+                    pd.to_datetime(p_base_disp["buy_date"]).dt.date.astype(str)
+                    + " | "
+                    + p_base_disp["ticker"]
+                    + " | "
+                    + p_base_disp["shares_open"].map(lambda x: f"{x:.3f}")
+                    + " @ "
+                    + p_base_disp["buy_price"].map(lambda x: f"{x:.2f}")
+                    + " | id="
+                    + p_base_disp["lot_id"].astype(str)
+                )
+                choice = st.selectbox("Select baseline lot to delete", p_base_disp["display"].tolist())
+                chosen_id = choice.split("id=")[-1].strip()
+
+                if st.button("Delete baseline lot"):
+                    baseline_all = baseline_all[baseline_all["lot_id"].astype(str) != chosen_id].copy()
+                    save_baseline(baseline_all)
+                    st.warning("Deleted baseline lot.")
+                    st.rerun()
+
+    # -----------------------
+    # Transactions tab
+    # -----------------------
+    with admin_tabs[2]:
+        st.subheader("Transactions")
+
+        with st.form("add_txn_form", clear_on_submit=True):
+            txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0)
+            t_date = st.date_input("Date", value=date.today())
+
+            if txn_type in ["buy", "sell"]:
+                c1, c2, c3 = st.columns([1, 1, 1])
+                with c1:
+                    t_ticker = st.text_input("Ticker", value="AAPL")
+                with c2:
+                    t_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
+                with c3:
+                    t_price = st.number_input("Price", min_value=0.0, value=100.00, step=0.01, format="%.2f")
+                t_amount = np.nan
+            else:
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    t_ticker = st.text_input("Ticker (optional)", value="")
+                with c2:
+                    t_amount = st.number_input("Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+                t_shares = np.nan
+                t_price = np.nan
+
+            add_txn = st.form_submit_button("Save transaction")
+
+        if add_txn:
+            row = {
+                "txn_id": str(pd.Timestamp.utcnow().value),
+                "portfolio": active,
+                "date": pd.to_datetime(t_date),
+                "type": txn_type,
+                "ticker": _clean_str(t_ticker).upper(),
+                "shares": float(round(t_shares, 3)) if pd.notna(t_shares) else np.nan,
+                "price": float(t_price) if pd.notna(t_price) else np.nan,
+                "amount": float(t_amount) if pd.notna(t_amount) else np.nan,
+            }
+
+            candidate_txns = pd.concat([txns_all, pd.DataFrame([row])], ignore_index=True)
+            p_txns = candidate_txns[candidate_txns["portfolio"] == active].copy()
+            p_base = baseline_all[baseline_all["portfolio"] == active].copy()
+
+            ok, msg = validate_candidate_state(meta, p_txns, p_base, match_method)
+            if not ok:
+                st.error(msg)
+            else:
+                txns_all = candidate_txns
+                save_txns(txns_all)
+                st.success("Saved.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("Delete transaction")
+
+        p_txns = txns_all[txns_all["portfolio"] == active].copy()
+        if p_txns.empty:
+            st.info("No transactions.")
+        else:
+            disp = p_txns.copy()
+            disp["date_str"] = pd.to_datetime(disp["date"]).dt.date.astype(str)
+            disp["desc"] = np.where(
+                disp["type"].isin(["buy", "sell"]),
+                disp["date_str"]
+                + " | "
+                + disp["type"]
+                + " | "
+                + disp["ticker"]
+                + " | "
+                + disp["shares"].map(lambda x: f"{x:.3f}")
+                + " @ "
+                + disp["price"].map(lambda x: f"{x:.2f}"),
+                disp["date_str"]
+                + " | dividend | "
+                + disp["ticker"].fillna("").astype(str)
+                + " | $"
+                + disp["amount"].map(lambda x: f"{x:.2f}"),
+            )
+            disp["display"] = disp["desc"] + " | id=" + disp["txn_id"].astype(str)
+
+            choice = st.selectbox("Select transaction", disp["display"].tolist(), key="del_txn_choice")
+            chosen_id = choice.split("id=")[-1].strip()
+
+            if st.button("Delete selected transaction"):
+                candidate_txns = txns_all[txns_all["txn_id"].astype(str) != chosen_id].copy()
+
+                p_txns2 = candidate_txns[candidate_txns["portfolio"] == active].copy()
+                p_base = baseline_all[baseline_all["portfolio"] == active].copy()
+                ok, msg = validate_candidate_state(meta, p_txns2, p_base, match_method)
+
+                if not ok:
+                    st.error(f"Delete rejected: {msg}")
+                else:
+                    txns_all = candidate_txns
+                    save_txns(txns_all)
+                    st.warning("Deleted.")
+                    st.rerun()
+
+    # -----------------------
+    # Documentation tab
+    # -----------------------
+    with admin_tabs[3]:
+        st.subheader("Documentation")
+        st.markdown(
+            """
+### Quick start
+
+**If you have full history (ledger-complete):**
+1. Go to **Portfolios** → set **Start mode** = `ledger_complete`
+2. Set **Starting cash** (cash at the beginning of your ledger)
+3. Enter **all buys/sells/dividends** in **Transactions**
+
+**If you only have today's holdings (snapshot-start):**
+1. Go to **Portfolios** → set **Start mode** = `snapshot_start`
+2. Set **As-of date** = the snapshot boundary (usually today)
+3. Set **Starting cash** = cash in the account on the as-of date
+4. Go to **Baseline lots** → add each holding with:
+   - ticker
+   - shares
+   - cost basis (price)
+   - acquisition date (inception date)
+5. Enter only **new** buys/sells/dividends after the as-of date in **Transactions**
+
+---
+
+### Charting notes
+- Charts start at the portfolio **As-of date** (no line before the start date).
+- Weekly mode samples on **Mondays**, but always includes the start date (fix for empty-week issue).
+
+---
+
+### Common errors
+
+- **Cash would go negative**
+  - Buy exceeds available cash.
+  - Increase Starting cash or reduce buy size.
+
+- **Invalid SELL: not enough shares**
+  - You tried to sell more than you own.
+  - Add missing baseline/buy entries or reduce the sell.
+
+- **Snapshot portfolios cannot have transactions before as-of date**
+  - Move the transaction date forward, or switch to ledger_complete.
+"""
+        )
+
+st.caption(
+    "Files used: portfolios.csv, baseline_lots.csv, transactions.csv. "
+    "Snapshot portfolios track from as-of date forward; baseline lots represent holdings at the boundary."
+)
