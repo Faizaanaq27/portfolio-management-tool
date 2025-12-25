@@ -582,7 +582,7 @@ if is_admin:
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
-    admin_tabs = st.tabs(["Portfolios", "Baseline lots", "Transactions"])
+    admin_tabs = st.tabs(["Portfolios", "Baseline lots", "Transactions", "Documentation"])
 
     # -----------------------
     # Portfolios tab
@@ -808,6 +808,105 @@ if is_admin:
                     save_txns(txns_all)
                     st.warning("Deleted.")
                     st.rerun()
+    # -----------------------
+    # Documentation tab
+    # -----------------------
+    with admin_tabs[3]:
+        st.subheader("Documentation")
+
+        st.markdown("""
+### Quick start
+
+**If you have full history (ledger-complete):**
+1. Go to **Portfolios** → set **Start mode** = `ledger_complete`
+2. Set **Starting cash** (cash at the beginning of your ledger)
+3. Enter **all buys/sells/dividends** in **Transactions**
+
+**If you only have today's holdings (snapshot-start):**
+1. Go to **Portfolios** → set **Start mode** = `snapshot_start`
+2. Set **As-of date** = the snapshot boundary (usually today)
+3. Set **Starting cash** = cash in the account on the as-of date
+4. Go to **Baseline lots** → add each holding with:
+   - ticker
+   - shares
+   - cost basis (price)
+   - acquisition date (inception date)
+5. Enter only **new** buys/sells/dividends after the as-of date in **Transactions**
+
+---
+
+### What each concept means
+
+#### Start mode
+- **`ledger_complete`**
+  - You have the full transaction history (or at least everything you care about).
+  - The app computes cash, lots, realized/unrealized P&L from the start of your ledger.
+
+- **`snapshot_start`**
+  - You *don’t* have full history.
+  - You define a “starting state” at the **As-of date** using:
+    - Starting cash
+    - Baseline lots (current holdings)
+  - The app tracks performance accurately **from the as-of date forward**.
+
+#### As-of date
+- The boundary date for snapshot portfolios.
+- In `snapshot_start`, transactions **before** this date are blocked.
+
+#### Starting cash
+- The cash balance **at the as-of date**.
+- Cash updates automatically from:
+  - **Buy** → cash decreases
+  - **Sell** → cash increases
+  - **Dividend** → cash increases
+
+#### Baseline lots
+- Used only for `snapshot_start` portfolios.
+- Represents positions that already existed on the as-of date.
+- Baseline lots affect **shares owned** and **P&L**, but do **not** change cash (because the cash impact happened before the snapshot).
+
+---
+
+### Transactions
+
+#### Buy
+- Creates a new lot at (date, price, shares)
+- Decreases cash by `shares * price`
+
+#### Sell
+- Closes lots using your chosen matching method (FIFO or LIFO)
+- Increases cash by `shares * price`
+- Realized P&L is computed lot-by-lot:
+  - `(sell_price - buy_price) * shares_sold`
+- The app blocks selling more shares than you own.
+
+#### Dividend
+- Immediately increases cash by the dividend amount
+- Does not create/close lots (cash-only event)
+
+---
+
+### Sell matching (FIFO / LIFO)
+- **FIFO**: sells the oldest lots first
+- **LIFO**: sells the newest lots first
+- This changes realized P&L timing (tax-style accounting), but not total long-run economics.
+
+---
+
+### Common errors
+
+- **Cash would go negative**
+  - Your buy exceeds available cash.
+  - Fix by increasing Starting cash or reducing buy size.
+
+- **Invalid SELL: not enough shares**
+  - You tried to sell more shares than you own (including baseline lots).
+  - Fix by adding the missing baseline lot / buy transaction, or reducing the sell.
+
+- **Snapshot portfolios cannot have transactions before as-of date**
+  - Move the transaction date forward, or switch portfolio to ledger_complete.
+        """)
+                    
 
 st.caption(
     "Files used: portfolios.csv, baseline_lots.csv, transactions.csv. "
