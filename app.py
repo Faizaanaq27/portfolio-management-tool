@@ -6,20 +6,12 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Portfolio Lots Tracker", layout="wide")
+st.set_page_config(page_title="Multi-Portfolio Lots Tracker", layout="wide")
 
 # =========================
-# 1) Simple single-login gate
+# 1) Single-login gate
 # =========================
 def check_password() -> bool:
-    """
-    Public view by default.
-    Admin view unlocks editing once correct password is entered.
-
-    Set ADMIN_PASSWORD in Streamlit Secrets:
-      - Local: .streamlit/secrets.toml
-      - Streamlit Cloud: App -> Settings -> Secrets
-    """
     if "is_admin" not in st.session_state:
         st.session_state.is_admin = False
 
@@ -52,7 +44,41 @@ with st.sidebar:
 # 2) Storage
 # =========================
 TXN_PATH = "transactions.csv"
-TXN_COLS = ["txn_id", "ticker", "date", "side", "shares", "price"]
+PORTFOLIO_PATH = "portfolios.csv"
+
+TXN_COLS = ["txn_id", "portfolio", "ticker", "date", "side", "shares", "price"]
+PORTFOLIO_COLS = ["portfolio"]
+
+
+def load_portfolios() -> pd.DataFrame:
+    """Persist portfolio names even if they have no transactions yet."""
+    try:
+        df = pd.read_csv(PORTFOLIO_PATH)
+    except FileNotFoundError:
+        df = pd.DataFrame(columns=PORTFOLIO_COLS)
+
+    for c in PORTFOLIO_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df = df[PORTFOLIO_COLS].copy()
+    df["portfolio"] = df["portfolio"].astype(str).str.strip()
+    df = df[df["portfolio"].notna() & (df["portfolio"] != "")]
+
+    # ensure default
+    if "Main" not in set(df["portfolio"].tolist()):
+        df = pd.concat([pd.DataFrame([{"portfolio": "Main"}]), df], ignore_index=True)
+
+    df = df.drop_duplicates().sort_values("portfolio").reset_index(drop=True)
+    return df
+
+
+def save_portfolios(df: pd.DataFrame) -> None:
+    out = df.copy()
+    out["portfolio"] = out["portfolio"].astype(str).str.strip()
+    out = out[out["portfolio"].notna() & (out["portfolio"] != "")]
+    out = out.drop_duplicates().sort_values("portfolio")
+    out.to_csv(PORTFOLIO_PATH, index=False)
 
 
 def load_txns() -> pd.DataFrame:
@@ -69,6 +95,9 @@ def load_txns() -> pd.DataFrame:
     if df.empty:
         return df
 
+    df["portfolio"] = df["portfolio"].astype(str).str.strip()
+    df.loc[df["portfolio"].isna() | (df["portfolio"] == "") , "portfolio"] = "Main"
+
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
     df["side"] = df["side"].astype(str).str.lower().str.strip()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -76,12 +105,12 @@ def load_txns() -> pd.DataFrame:
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["txn_id"] = df["txn_id"].astype(str)
 
-    df = df.dropna(subset=["ticker", "side", "date", "shares", "price"])
+    df = df.dropna(subset=["portfolio", "ticker", "side", "date", "shares", "price"])
     df = df[df["side"].isin(["buy", "sell"])]
     df = df[df["shares"] > 0]
     df = df[df["price"] >= 0]
 
-    return df.sort_values(["ticker", "date", "txn_id"])
+    return df.sort_values(["portfolio", "ticker", "date", "txn_id"])
 
 
 def save_txns(df: pd.DataFrame) -> None:
@@ -114,11 +143,7 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
 
 
 def build_lots(txns: pd.DataFrame, method: str = "FIFO"):
-    """
-    Lot-based accounting:
-      - Each BUY creates a separate lot.
-      - Each SELL consumes lots via FIFO or LIFO, producing realized matches.
-    """
+    """Lot-based accounting for a single portfolio's transactions."""
     open_cols = ["lot_id", "ticker", "buy_date", "buy_price", "shares_open"]
     real_cols = [
         "sale_id",
@@ -143,11 +168,10 @@ def build_lots(txns: pd.DataFrame, method: str = "FIFO"):
     realized = []
 
     for tkr, g in txns.groupby("ticker"):
-        lots = []  # active lots for this ticker
+        lots = []
 
         for _, r in g.iterrows():
-            side = r["side"]
-            if side == "buy":
+            if r["side"] == "buy":
                 lots.append(
                     {
                         "lot_id": r["txn_id"],
@@ -157,8 +181,7 @@ def build_lots(txns: pd.DataFrame, method: str = "FIFO"):
                         "shares_open": float(r["shares"]),
                     }
                 )
-
-            elif side == "sell":
+            else:  # sell
                 sell_shares = float(r["shares"])
                 sell_price = float(r["price"])
                 sell_date = r["date"].date()
@@ -192,90 +215,117 @@ def build_lots(txns: pd.DataFrame, method: str = "FIFO"):
                     lotref["shares_open"] -= take
                     sell_shares -= take
 
-                # If sell_shares remains > 0, user sold more than owned; ignored by design.
-
         open_lots.extend([x for x in lots if x["shares_open"] > 1e-12])
 
-    return (
-        pd.DataFrame(open_lots, columns=open_cols),
-        pd.DataFrame(realized, columns=real_cols),
-    )
+    return pd.DataFrame(open_lots, columns=open_cols), pd.DataFrame(realized, columns=real_cols)
 
 
 # =========================
 # 3) App UI
 # =========================
-st.title("Manual Portfolio Tracker (Lot-Based)")
+st.title("Manual Portfolio Tracker (Lot-Based, Multi-Portfolio)")
 
-txns = load_txns()
+portfolios_df = load_portfolios()
+txns_all = load_txns()
+
+# Ensure any portfolios found in transactions also appear in portfolios.csv
+if not txns_all.empty:
+    existing = set(portfolios_df["portfolio"].tolist())
+    found = set(txns_all["portfolio"].astype(str).str.strip().tolist())
+    missing = sorted([p for p in found if p and p not in existing])
+    if missing:
+        portfolios_df = pd.concat(
+            [portfolios_df, pd.DataFrame([{"portfolio": p} for p in missing])],
+            ignore_index=True,
+        )
+        save_portfolios(portfolios_df)
+
+portfolio_names = portfolios_df["portfolio"].tolist()
 
 st.sidebar.header("Lot settings")
 match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
 
-# Public always sees these tabs; Admin gets an extra tab for editing
-if is_admin:
-    tab_overview, tab_admin, tab_txns = st.tabs(["Public View", "Admin (Edit)", "Transactions"])
-else:
-    tab_overview, tab_txns = st.tabs(["Public View", "Transactions"])
+# --- Public: show each portfolio as a tab ---
+st.subheader("Public View (read-only)")
+tabs = st.tabs(portfolio_names)
 
-# ---------- Public View (read-only) ----------
-with tab_overview:
-    st.subheader("Lots & Returns")
-
+def render_portfolio_view(portfolio_name: str):
+    txns = txns_all[txns_all["portfolio"] == portfolio_name].copy()
     open_lots, realized = build_lots(txns, method=match_method)
 
-    if open_lots.empty and realized.empty:
-        st.info("No transactions yet. Log in to add your first trade.")
-    else:
-        # Open lots (unrealized)
-        if not open_lots.empty:
-            tickers = sorted(open_lots["ticker"].unique().tolist())
-            live = fetch_last_prices(tickers)
+    if txns.empty:
+        st.info("No transactions yet in this portfolio.")
+        return
 
-            lots_view = open_lots.copy()
-            lots_view["last_price"] = lots_view["ticker"].map(live).astype(float)
-            lots_view["market_value"] = lots_view["shares_open"] * lots_view["last_price"]
-            lots_view["unrealized_pnl"] = lots_view["shares_open"] * (
-                lots_view["last_price"] - lots_view["buy_price"]
-            )
-            lots_view["unrealized_return_%"] = np.where(
-                lots_view["buy_price"] > 0,
-                ((lots_view["last_price"] / lots_view["buy_price"]) - 1.0) * 100.0,
-                np.nan,
-            )
+    # Open lots
+    if not open_lots.empty:
+        tickers = sorted(open_lots["ticker"].unique().tolist())
+        live = fetch_last_prices(tickers)
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Open lots", f"{len(lots_view)}")
-            m2.metric("Unrealized P&L", f"${lots_view['unrealized_pnl'].sum():,.2f}")
-            m3.metric("Open Market Value", f"${lots_view['market_value'].sum():,.2f}")
+        lots_view = open_lots.copy()
+        lots_view["last_price"] = lots_view["ticker"].map(live).astype(float)
+        lots_view["market_value"] = lots_view["shares_open"] * lots_view["last_price"]
+        lots_view["unrealized_pnl"] = lots_view["shares_open"] * (lots_view["last_price"] - lots_view["buy_price"])
+        lots_view["unrealized_return_%"] = np.where(
+            lots_view["buy_price"] > 0,
+            ((lots_view["last_price"] / lots_view["buy_price"]) - 1.0) * 100.0,
+            np.nan,
+        )
 
-            st.write("**Open lots (unrealized)**")
-            st.dataframe(
-                lots_view.sort_values(["ticker", "buy_date"]),
-                use_container_width=True,
-            )
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Open lots", f"{len(lots_view)}")
+        m2.metric("Unrealized P&L", f"${lots_view['unrealized_pnl'].sum():,.2f}")
+        m3.metric("Open Market Value", f"${lots_view['market_value'].sum():,.2f}")
 
-        # Realized matches (per-lot)
-        if not realized.empty:
-            realized_view = realized.copy()
-            realized_view["realized_return_%"] = np.where(
-                realized_view["buy_price"] > 0,
-                ((realized_view["sell_price"] / realized_view["buy_price"]) - 1.0) * 100.0,
-                np.nan,
-            )
-            st.write("**Realized matches (each SELL matched to specific BUY lots)**")
-            st.dataframe(
-                realized_view.sort_values(["sell_date", "ticker"], ascending=False),
-                use_container_width=True,
-            )
-            st.metric("Realized P&L", f"${realized_view['pnl'].sum():,.2f}")
+        st.write("**Open lots (unrealized)**")
+        st.dataframe(lots_view.sort_values(["ticker", "buy_date"]), use_container_width=True)
 
-    st.caption("Public view is read-only. Log in to add/edit/delete transactions.")
+    # Realized
+    if not realized.empty:
+        realized_view = realized.copy()
+        realized_view["realized_return_%"] = np.where(
+            realized_view["buy_price"] > 0,
+            ((realized_view["sell_price"] / realized_view["buy_price"]) - 1.0) * 100.0,
+            np.nan,
+        )
+        st.write("**Realized matches (each SELL matched to specific BUY lots)**")
+        st.dataframe(realized_view.sort_values(["sell_date", "ticker"], ascending=False), use_container_width=True)
+        st.metric("Realized P&L", f"${realized_view['pnl'].sum():,.2f}")
 
-# ---------- Admin (Edit) ----------
+    st.markdown("---")
+    st.write("**Transactions (read-only)**")
+    st.dataframe(txns.sort_values("date", ascending=False), use_container_width=True)
+
+for i, p in enumerate(portfolio_names):
+    with tabs[i]:
+        st.markdown(f"### {p}")
+        render_portfolio_view(p)
+
+# --- Admin controls (only if logged in) ---
 if is_admin:
-    with tab_admin:
-        st.subheader("Add transaction (Admin only)")
+    st.markdown("---")
+    st.subheader("Admin (edit enabled)")
+
+    colA, colB = st.columns([1, 2])
+
+    with colA:
+        st.markdown("#### Create a new portfolio")
+        new_name = st.text_input("Portfolio name", value="", placeholder="e.g., Long Only, Trading, IRA")
+        if st.button("Add portfolio", type="primary"):
+            name = (new_name or "").strip()
+            if not name:
+                st.error("Enter a portfolio name.")
+            elif name in set(portfolio_names):
+                st.warning("That portfolio already exists.")
+            else:
+                portfolios_df = pd.concat([portfolios_df, pd.DataFrame([{"portfolio": name}])], ignore_index=True)
+                save_portfolios(portfolios_df)
+                st.success("Portfolio added.")
+                st.rerun()
+
+    with colB:
+        st.markdown("#### Add / Delete transactions")
+        active_portfolio = st.selectbox("Active portfolio", portfolio_names, index=0)
 
         c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1])
         with c1:
@@ -303,62 +353,47 @@ if is_admin:
                 key="admin_price",
             )
 
-        if st.button("Save transaction", type="primary"):
-            new_row = {
-                "txn_id": str(pd.Timestamp.utcnow().value),  # unique-ish id
+        if st.button("Save transaction", type="primary", key="save_txn"):
+            row = {
+                "txn_id": str(pd.Timestamp.utcnow().value),
+                "portfolio": active_portfolio,
                 "ticker": t_ticker.strip().upper(),
                 "date": pd.to_datetime(t_date),
                 "side": t_side,
                 "shares": float(round(t_shares, 3)),
                 "price": float(t_price),
             }
-            txns = pd.concat([txns, pd.DataFrame([new_row])], ignore_index=True)
-            save_txns(txns)
+            txns_all = pd.concat([txns_all, pd.DataFrame([row])], ignore_index=True)
+            save_txns(txns_all)
             st.success("Saved.")
             st.rerun()
 
-        st.markdown("---")
-        st.subheader("Delete transaction (Admin only)")
-        if txns.empty:
-            st.info("No transactions to delete.")
+        st.markdown("**Delete a transaction**")
+        txns_active = txns_all[txns_all["portfolio"] == active_portfolio].copy()
+        if txns_active.empty:
+            st.info("No transactions in this portfolio.")
         else:
-            # Show a friendly selector
-            display_df = txns.copy()
-            display_df["display"] = (
-                display_df["date"].dt.date.astype(str)
+            disp = txns_active.copy()
+            disp["display"] = (
+                disp["date"].dt.date.astype(str)
                 + " | "
-                + display_df["ticker"]
+                + disp["ticker"]
                 + " | "
-                + display_df["side"]
+                + disp["side"]
                 + " | "
-                + display_df["shares"].map(lambda x: f"{x:.3f}")
+                + disp["shares"].map(lambda x: f"{x:.3f}")
                 + " @ "
-                + display_df["price"].map(lambda x: f"{x:.2f}")
+                + disp["price"].map(lambda x: f"{x:.2f}")
                 + " | id="
-                + display_df["txn_id"].astype(str)
+                + disp["txn_id"].astype(str)
             )
-            choice = st.selectbox(
-                "Select a transaction to delete",
-                display_df["display"].tolist(),
-            )
+            choice = st.selectbox("Select transaction", disp["display"].tolist(), key="delete_choice")
             chosen_id = choice.split("id=")[-1].strip()
 
-            if st.button("Delete selected transaction", type="secondary"):
-                txns = txns[txns["txn_id"].astype(str) != chosen_id].copy()
-                save_txns(txns)
+            if st.button("Delete selected", key="delete_btn"):
+                txns_all = txns_all[txns_all["txn_id"].astype(str) != chosen_id].copy()
+                save_txns(txns_all)
                 st.warning("Deleted.")
                 st.rerun()
 
-        st.caption("Admin tab is the only place that can modify data.")
-
-# ---------- Transactions (read-only table for everyone) ----------
-with tab_txns:
-    st.subheader("All transactions")
-    if txns.empty:
-        st.info("No transactions yet.")
-    else:
-        st.dataframe(txns.sort_values("date", ascending=False), use_container_width=True)
-
-    st.caption(
-        f"Stored in `{TXN_PATH}` (CSV). If you deploy to Streamlit Cloud, CSV persistence may not behave like a real database."
-    )
+st.caption("Note: This uses CSV files (transactions.csv + portfolios.csv). For production persistence, swap to SQLite/Postgres.")
