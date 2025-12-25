@@ -507,14 +507,15 @@ portfolio_names = portfolios_df["portfolio"].tolist()
 # =========================
 # 5) UI
 # =========================
-st.title("Manual Portfolio Tracker")
-st.caption("Public view is read-only. Admin can edit and create portfolios, baseline lots, and transactions.")
+
+st.title("Brown Investment Group Portfolio")
+st.caption("Welcome.")
 
 st.sidebar.header("Lot settings")
 match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
 
 # ---------- Public view: tabs ----------
-st.subheader("Public View (read-only)")
+st.subheader("Public View")
 tabs = st.tabs(portfolio_names)
 
 
