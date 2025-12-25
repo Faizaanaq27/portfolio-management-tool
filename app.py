@@ -22,6 +22,8 @@ def check_password() -> bool:
 
     if st.session_state.is_admin:
         return True
+    
+    st.sidebar.image("biglogo-white.png", use_container_width=True)
 
     with st.sidebar:
         st.markdown("### Admin login")
@@ -45,7 +47,7 @@ with st.sidebar:
         st.session_state.is_admin = False
         st.rerun()
 
-st.sidebar.image("biglogo-white.png", use_container_width=True)
+
 
 # =========================
 # 2) Storage (CSV)
