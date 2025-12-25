@@ -6,6 +6,11 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
+from pathlib import Path
+import streamlit as st
+
+LOGO_PATH = Path(__file__).parent / "biglogo-white.png"
+
 st.set_page_config(page_title="Multi-Portfolio Tracker (Cash + Snapshot)", layout="wide")
 
 # =========================
@@ -508,6 +513,7 @@ portfolio_names = portfolios_df["portfolio"].tolist()
 # 5) UI
 # =========================
 
+st.image(str(LOGO_PATH), width=220)
 st.title("Brown Investment Group Portfolio")
 st.caption("Welcome.")
 
