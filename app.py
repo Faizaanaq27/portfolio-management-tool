@@ -1,17 +1,20 @@
 import hmac
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-from pathlib import Path
-import streamlit as st
-
-LOGO_PATH = Path(__file__).parent / "biglogo-white.png"
-
 st.set_page_config(page_title="Multi-Portfolio Tracker (Cash + Snapshot)", layout="wide")
+
+# =========================
+# 0) Optional branding
+# =========================
+LOGO_PATH = Path(__file__).parent / "biglogo-white.png"
+if LOGO_PATH.exists():
+    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
 
 # =========================
 # 1) Single-login gate
@@ -22,8 +25,6 @@ def check_password() -> bool:
 
     if st.session_state.is_admin:
         return True
-    
-    st.sidebar.image("biglogo-white.png", use_container_width=True)
 
     with st.sidebar:
         st.markdown("### Admin login")
@@ -47,8 +48,6 @@ with st.sidebar:
         st.session_state.is_admin = False
         st.rerun()
 
-
-
 # =========================
 # 2) Storage (CSV)
 # =========================
@@ -56,14 +55,9 @@ TXN_PATH = "transactions.csv"
 PORTFOLIO_PATH = "portfolios.csv"
 BASELINE_PATH = "baseline_lots.csv"
 
-# Transactions ledger: buy/sell/dividend (dividend is cash-only)
 TXN_COLS = ["txn_id", "portfolio", "date", "type", "ticker", "shares", "price", "amount"]
-
-# Portfolio metadata supports two modes
 PORTFOLIO_COLS = ["portfolio", "start_mode", "as_of_date", "starting_cash"]
 VALID_MODES = ["ledger_complete", "snapshot_start"]
-
-# Baseline lots (for snapshot portfolios)
 BASELINE_COLS = ["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shares_open"]
 
 
@@ -91,7 +85,6 @@ def load_portfolios() -> pd.DataFrame:
     df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce")
     df["starting_cash"] = pd.to_numeric(df["starting_cash"], errors="coerce").fillna(0.0)
 
-    # Default portfolio
     if "Main" not in set(df["portfolio"].tolist()):
         df = pd.concat(
             [
@@ -110,9 +103,7 @@ def load_portfolios() -> pd.DataFrame:
             ignore_index=True,
         )
 
-    # If as_of_date missing, default to today
     df.loc[df["as_of_date"].isna(), "as_of_date"] = pd.to_datetime(date.today())
-
     df = df.drop_duplicates(subset=["portfolio"]).sort_values("portfolio").reset_index(drop=True)
     return df
 
@@ -159,12 +150,10 @@ def load_txns() -> pd.DataFrame:
     df = df.dropna(subset=["portfolio", "date", "type", "txn_id"])
     df = df[df["type"].isin(["buy", "sell", "dividend"])].copy()
 
-    # buy/sell require ticker, shares, price
     is_trade = df["type"].isin(["buy", "sell"])
     trades = df[is_trade].dropna(subset=["ticker", "shares", "price"]).copy()
     trades = trades[(trades["shares"] > 0) & (trades["price"] >= 0)]
 
-    # dividends require amount; ticker optional
     divs = df[~is_trade].dropna(subset=["amount"]).copy()
     divs = divs[divs["amount"] >= 0]
     divs["ticker"] = divs["ticker"].fillna("").astype(str)
@@ -228,17 +217,37 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
     return close.astype(float)
 
 
+@st.cache_data(ttl=900)
+def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame()
+
+    data = yf.download(
+        tickers,
+        start=pd.to_datetime(start).date(),
+        end=(pd.to_datetime(end) + pd.Timedelta(days=1)).date(),
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+    )
+
+    if isinstance(data.columns, pd.MultiIndex):
+        px = data["Close"].copy()
+    else:
+        px = pd.DataFrame({tickers[0]: data["Close"]})
+
+    px.index = pd.to_datetime(px.index).normalize()
+    px.columns = [str(c).upper() for c in px.columns]
+    px = px.sort_index().ffill()
+    return px
+
+
 # =========================
 # 3) Lot engine + accounting
 # =========================
 def apply_sell_to_lots(lots: list[dict], sell_shares: float, method: str):
-    """
-    Mutates lots in-place (each lot has shares_open, buy_price, buy_date, lot_id, ticker).
-    Returns list of realized match rows: (lot, shares_sold).
-    """
     realized_rows = []
     remaining = sell_shares
-
     lot_iter = lots if method.upper() == "FIFO" else list(reversed(lots))
 
     i = 0
@@ -255,17 +264,11 @@ def apply_sell_to_lots(lots: list[dict], sell_shares: float, method: str):
 
 
 def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, method: str):
-    """
-    Build open lots + realized matches using:
-      - baseline lots as starting inventory
-      - trades (buy/sell) as additional lots / reductions
-    """
     open_cols = ["lot_id", "ticker", "buy_date", "buy_price", "shares_open"]
     real_cols = ["sale_id", "ticker", "buy_date", "buy_price", "sell_date", "sell_price", "shares_sold", "pnl"]
 
     lots_by_ticker = {}
 
-    # Starting lots from baseline
     if not baseline.empty:
         for _, r in baseline.iterrows():
             t = str(r["ticker"]).upper().strip()
@@ -360,12 +363,6 @@ def validate_candidate_state(
     portfolio_baseline: pd.DataFrame,
     method: str,
 ) -> tuple[bool, str]:
-    """
-    Enforce:
-      - In snapshot_start: no txns dated before as_of_date
-      - Cash never negative (starting_cash + cashflows)
-      - Cannot sell more shares than owned (baseline lots + buys - sells)
-    """
     start_mode = portfolio_meta["start_mode"]
     as_of = pd.to_datetime(portfolio_meta["as_of_date"])
     starting_cash = float(portfolio_meta["starting_cash"])
@@ -375,19 +372,16 @@ def validate_candidate_state(
         txns["date"] = pd.to_datetime(txns["date"])
         txns = txns.sort_values(["date", "txn_id"])
 
-    # Snapshot boundary rule
     if start_mode == "snapshot_start" and not txns.empty:
         if (txns["date"] < as_of).any():
             return False, f"Snapshot portfolios cannot have transactions before as-of date ({as_of.date()})."
 
-    # Cash constraint (baseline lots do NOT affect cash)
     cash = starting_cash
     for _, r in txns.iterrows():
         cash += cash_delta(r)
         if cash < -1e-9:
             return False, "Invalid: cash would go negative (margin not allowed)."
 
-    # Share constraint: baseline + buys - sells
     trades = txns[txns["type"].isin(["buy", "sell"])].copy()
     if trades.empty:
         return True, ""
@@ -412,9 +406,6 @@ def validate_candidate_state(
 
 
 def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.DataFrame, method: str):
-    """
-    Returns metrics + tables for display.
-    """
     as_of = pd.to_datetime(portfolio_meta["as_of_date"])
     start_mode = portfolio_meta["start_mode"]
     starting_cash = float(portfolio_meta["starting_cash"])
@@ -423,18 +414,14 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"])
 
-    # For snapshot portfolios, only consider txns on/after as_of
     if start_mode == "snapshot_start" and not df.empty:
         df = df[df["date"] >= as_of].copy()
 
-    # Cash (baseline lots do not affect cash)
     cash_now = starting_cash + (df.apply(cash_delta, axis=1).sum() if not df.empty else 0.0)
 
-    # Lots and realized from trades + baseline
     trades = df[df["type"].isin(["buy", "sell"])].copy() if not df.empty else pd.DataFrame(columns=TXN_COLS)
     open_lots, realized = build_lots_with_baseline(trades, baseline, method)
 
-    # Live pricing + unrealized
     if not open_lots.empty:
         tickers = sorted(open_lots["ticker"].unique().tolist())
         live = fetch_last_prices(tickers)
@@ -464,7 +451,7 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
         holdings = pd.DataFrame()
 
     mv = float(lots_view["market_value"].sum()) if not lots_view.empty else 0.0
-    nav = cash_now + mv
+    nav = float(cash_now + mv)
     unreal = float(lots_view["unrealized_pnl"].sum()) if not lots_view.empty else 0.0
     real = float(realized["pnl"].sum()) if not realized.empty else 0.0
 
@@ -485,13 +472,114 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 
 
 # =========================
-# 4) Load data + reconcile
+# 4) Chart helpers (NAV series)
+# =========================
+def _portfolio_start_date(meta: dict) -> pd.Timestamp:
+    return pd.to_datetime(meta["as_of_date"]).normalize()
+
+
+def compute_nav_series_for_portfolio(
+    pname: str,
+    meta: dict,
+    txns_all: pd.DataFrame,
+    baseline_all: pd.DataFrame,
+    end_date: pd.Timestamp,
+) -> pd.Series:
+    start = _portfolio_start_date(meta)
+    end = pd.to_datetime(end_date).normalize()
+
+    txns = txns_all[txns_all["portfolio"] == pname].copy()
+    if not txns.empty:
+        txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
+        txns = txns.sort_values(["date", "txn_id"])
+        txns = txns[txns["date"] >= start].copy()
+
+    baseline = baseline_all[baseline_all["portfolio"] == pname].copy()
+    if not baseline.empty:
+        baseline["ticker"] = baseline["ticker"].astype(str).str.upper().str.strip()
+
+    idx = pd.date_range(start=start, end=end, freq="D")
+
+    # Cash series
+    starting_cash = float(meta["starting_cash"])
+    cash_flow = pd.Series(0.0, index=idx)
+    if not txns.empty:
+        cf = txns.apply(cash_delta, axis=1)
+        cf_by_day = cf.groupby(txns["date"]).sum()
+        cash_flow.loc[cf_by_day.index.intersection(idx)] = cf_by_day.reindex(idx, fill_value=0.0)
+    cash = starting_cash + cash_flow.cumsum()
+
+    # Shares series
+    baseline_shares = {}
+    if not baseline.empty:
+        for _, r in baseline.iterrows():
+            t = str(r["ticker"]).upper().strip()
+            baseline_shares[t] = baseline_shares.get(t, 0.0) + float(r["shares_open"])
+
+    trades = txns[txns["type"].isin(["buy", "sell"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
+    tickers = set(baseline_shares.keys())
+
+    if not trades.empty:
+        trades["ticker"] = trades["ticker"].astype(str).str.upper().str.strip()
+        trades["signed_shares"] = np.where(trades["type"] == "buy", trades["shares"], -trades["shares"])
+        for t in trades["ticker"].unique():
+            if t:
+                tickers.add(t)
+
+    tickers = sorted([t for t in tickers if t])
+    if not tickers:
+        nav = cash.copy()
+        nav.name = pname
+        return nav
+
+    shares_df = pd.DataFrame(0.0, index=idx, columns=tickers)
+
+    # Baseline injection at start
+    for t, sh in baseline_shares.items():
+        if t in shares_df.columns:
+            shares_df.loc[idx[0], t] += sh
+
+    if not trades.empty:
+        for t in tickers:
+            t_tr = trades[trades["ticker"] == t]
+            if t_tr.empty:
+                continue
+            delta_by_day = t_tr.groupby("date")["signed_shares"].sum()
+            shares_df.loc[delta_by_day.index.intersection(idx), t] += delta_by_day.reindex(idx, fill_value=0.0)
+
+    shares_df = shares_df.cumsum()
+
+    px = fetch_price_history(tickers, start, end)
+    if px.empty:
+        nav = cash.copy()
+        nav.name = pname
+        return nav
+
+    px = px.reindex(idx).ffill()
+    mv = (shares_df * px[tickers]).sum(axis=1)
+    nav = cash + mv
+    nav.name = pname
+    return nav
+
+
+def index_to_100(series: pd.Series) -> pd.Series:
+    s = series.copy()
+    first = s.first_valid_index()
+    if first is None:
+        return s
+    base = float(s.loc[first])
+    if base == 0:
+        return s
+    return (s / base) * 100.0
+
+
+# =========================
+# 5) Load data + reconcile
 # =========================
 portfolios_df = load_portfolios()
 txns_all = load_txns()
 baseline_all = load_baseline()
 
-# Ensure portfolios referenced by txns exist
 if not txns_all.empty:
     existing = set(portfolios_df["portfolio"].tolist())
     found = set(txns_all["portfolio"].astype(str).str.strip().tolist())
@@ -514,18 +602,18 @@ if not txns_all.empty:
 portfolio_names = portfolios_df["portfolio"].tolist()
 
 # =========================
-# 5) UI
+# 6) UI
 # =========================
-
 st.title("Brown Investment Group Portfolio")
-st.caption("Welcome.")
+st.caption("Public view is read-only. Admin can edit portfolios, baseline lots, and transactions.")
 
 st.sidebar.header("Lot settings")
 match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
 
-# ---------- Public view: tabs ----------
-st.subheader("Public View")
-tabs = st.tabs(portfolio_names)
+# ---------- Public view ----------
+st.subheader("Public View (read-only)")
+
+public_tabs = st.tabs(["Overview"] + portfolio_names)
 
 
 def render_public_portfolio(pname: str):
@@ -578,17 +666,117 @@ def render_public_portfolio(pname: str):
         st.dataframe(snap["filtered_txns"], use_container_width=True)
 
 
-for i, p in enumerate(portfolio_names):
-    with tabs[i]:
+# ----------------------------
+# Overview tab
+# ----------------------------
+with public_tabs[0]:
+    st.markdown("## Overview")
+
+    end_date = pd.to_datetime(date.today())
+    nav_series = {}
+    cash_now_by_port = {}
+    pnl_now_by_port = {}
+
+    # Snapshot metrics + NAV series
+    for p in portfolio_names:
+        meta = get_portfolio_meta(portfolios_df, p)
+        p_txns = txns_all[txns_all["portfolio"] == p].copy()
+        p_base = baseline_all[baseline_all["portfolio"] == p].copy()
+
+        snap = portfolio_snapshot(meta, p_txns, p_base, match_method)
+        cash_now_by_port[p] = snap["cash"]
+        pnl_now_by_port[p] = snap["realized_pnl"] + snap["unrealized_pnl"]
+
+        nav_series[p] = compute_nav_series_for_portfolio(
+            pname=p,
+            meta=meta,
+            txns_all=txns_all,
+            baseline_all=baseline_all,
+            end_date=end_date,
+        )
+
+    nav_df = pd.DataFrame(nav_series).sort_index()
+    agg_nav = nav_df.fillna(0.0).sum(axis=1)
+    agg_nav.name = "Aggregate"
+
+    total_cash = float(np.nansum(list(cash_now_by_port.values()))) if cash_now_by_port else 0.0
+    total_pnl = float(np.nansum(list(pnl_now_by_port.values()))) if pnl_now_by_port else 0.0
+    total_nav = float(agg_nav.iloc[-1]) if not agg_nav.empty else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("ALL Total Cash", f"${total_cash:,.2f}")
+    c2.metric("ALL Total Gains (P&L)", f"${total_pnl:,.2f}")
+    c3.metric("ALL NAV (Cash + MV)", f"${total_nav:,.2f}")
+
+    st.divider()
+
+    # Relative performance (indexed) + SPY baseline
+    earliest = None
+    for s in nav_series.values():
+        fv = s.first_valid_index()
+        if fv is not None:
+            earliest = fv if earliest is None else min(earliest, fv)
+
+    if earliest is None or nav_df.empty:
+        st.info("Add at least one portfolio with data to see charts.")
+    else:
+        # SPY baseline on same date index
+        spy_px = fetch_price_history(["SPY"], earliest, end_date)
+        if not spy_px.empty:
+            spy = spy_px["SPY"].reindex(nav_df.index).ffill()
+            spy = index_to_100(spy)
+        else:
+            spy = pd.Series(index=nav_df.index, dtype=float)
+
+        rel = pd.DataFrame({p: index_to_100(nav_df[p]) for p in nav_df.columns})
+        rel["SPY"] = spy
+
+        st.markdown("### Relative performance (Indexed to 100 at series start)")
+        st.line_chart(rel)
+
+        st.markdown("### Aggregate growth (Indexed)")
+        st.line_chart(index_to_100(agg_nav))
+
+    st.divider()
+
+    # Portfolio grid: columns = number of portfolios
+    st.markdown("## Portfolios")
+    if not portfolio_names:
+        st.write("No portfolios yet.")
+    else:
+        cols = st.columns(len(portfolio_names))
+        for i, p in enumerate(portfolio_names):
+            with cols[i]:
+                meta = get_portfolio_meta(portfolios_df, p)
+                p_txns = txns_all[txns_all["portfolio"] == p].copy()
+                p_base = baseline_all[baseline_all["portfolio"] == p].copy()
+                snap = portfolio_snapshot(meta, p_txns, p_base, match_method)
+
+                st.markdown(f"### {p}")
+                st.caption(f"Start date: {pd.to_datetime(meta['as_of_date']).date()}")
+                st.metric("NAV", f"${snap['nav']:,.2f}")
+                st.metric("Cash", f"${snap['cash']:,.2f}")
+                st.metric("Total P&L", f"${(snap['realized_pnl'] + snap['unrealized_pnl']):,.2f}")
+
+                nav = nav_series.get(p)
+                if nav is not None and not nav.empty:
+                    st.line_chart(index_to_100(nav))
+                else:
+                    st.write("No data yet.")
+
+# ----------------------------
+# Individual portfolio tabs
+# ----------------------------
+for i, p in enumerate(portfolio_names, start=1):
+    with public_tabs[i]:
         st.markdown(f"## {p}")
         render_public_portfolio(p)
 
-# ---------- Admin section (REFINED UI) ----------
+# ---------- Admin section ----------
 if is_admin:
     st.markdown("---")
     st.header("Admin")
 
-    # One selector for the whole admin area
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
@@ -640,7 +828,11 @@ if is_admin:
             mode_u = st.selectbox("Start mode", VALID_MODES, index=VALID_MODES.index(meta["start_mode"]))
             asof_u = st.date_input("As-of date", value=meta["as_of_date"].date())
             cash_u = st.number_input(
-                "Starting cash ($)", min_value=0.0, value=float(meta["starting_cash"]), step=100.0, format="%.2f"
+                "Starting cash ($)",
+                min_value=0.0,
+                value=float(meta["starting_cash"]),
+                step=100.0,
+                format="%.2f",
             )
             saved = st.form_submit_button("Save settings")
 
@@ -818,12 +1010,12 @@ if is_admin:
                     save_txns(txns_all)
                     st.warning("Deleted.")
                     st.rerun()
+
     # -----------------------
     # Documentation tab
     # -----------------------
     with admin_tabs[3]:
         st.subheader("Documentation")
-
         st.markdown("""
 ### Quick start
 
@@ -849,14 +1041,14 @@ if is_admin:
 
 #### Start mode
 - **`ledger_complete`**
-  - You have the full transaction history (or at least everything you care about).
+  - You have the full transaction history.
   - The app computes cash, lots, realized/unrealized P&L from the start of your ledger.
 
 - **`snapshot_start`**
-  - You *don’t* have full history.
+  - You don’t have full history.
   - You define a “starting state” at the **As-of date** using:
     - Starting cash
-    - Baseline lots (current holdings)
+    - Baseline lots (holdings)
   - The app tracks performance accurately **from the as-of date forward**.
 
 #### As-of date
@@ -864,16 +1056,16 @@ if is_admin:
 - In `snapshot_start`, transactions **before** this date are blocked.
 
 #### Starting cash
-- The cash balance **at the as-of date**.
-- Cash updates automatically from:
+- Cash balance **at the as-of date**.
+- Updates automatically from:
   - **Buy** → cash decreases
   - **Sell** → cash increases
   - **Dividend** → cash increases
 
 #### Baseline lots
-- Used only for `snapshot_start` portfolios.
-- Represents positions that already existed on the as-of date.
-- Baseline lots affect **shares owned** and **P&L**, but do **not** change cash (because the cash impact happened before the snapshot).
+- Used only for `snapshot_start`.
+- Represents positions that existed on the as-of date.
+- Affects **shares owned** and **P&L**, but does **not** change cash.
 
 ---
 
@@ -881,42 +1073,33 @@ if is_admin:
 
 #### Buy
 - Creates a new lot at (date, price, shares)
-- Decreases cash by `shares * price`
+- Cash decreases by `shares * price`
 
 #### Sell
-- Closes lots using your chosen matching method (FIFO or LIFO)
-- Increases cash by `shares * price`
-- Realized P&L is computed lot-by-lot:
-  - `(sell_price - buy_price) * shares_sold`
+- Closes lots using FIFO or LIFO
+- Cash increases by `shares * price`
+- Realized P&L = `(sell_price - buy_price) * shares_sold`
 - The app blocks selling more shares than you own.
 
 #### Dividend
-- Immediately increases cash by the dividend amount
-- Does not create/close lots (cash-only event)
-
----
-
-### Sell matching (FIFO / LIFO)
-- **FIFO**: sells the oldest lots first
-- **LIFO**: sells the newest lots first
-- This changes realized P&L timing (tax-style accounting), but not total long-run economics.
+- Cash increases immediately by the dividend amount
+- Cash-only event (no lots)
 
 ---
 
 ### Common errors
 
 - **Cash would go negative**
-  - Your buy exceeds available cash.
-  - Fix by increasing Starting cash or reducing buy size.
+  - Buy exceeds available cash.
+  - Increase Starting cash or reduce buy size.
 
 - **Invalid SELL: not enough shares**
-  - You tried to sell more shares than you own (including baseline lots).
-  - Fix by adding the missing baseline lot / buy transaction, or reducing the sell.
+  - You tried to sell more than you own.
+  - Add missing baseline/buy entries or reduce the sell.
 
 - **Snapshot portfolios cannot have transactions before as-of date**
-  - Move the transaction date forward, or switch portfolio to ledger_complete.
-        """)
-                    
+  - Move the transaction date forward, or switch to ledger_complete.
+""")
 
 st.caption(
     "Files used: portfolios.csv, baseline_lots.csv, transactions.csv. "
