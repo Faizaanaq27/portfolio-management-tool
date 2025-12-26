@@ -1087,6 +1087,25 @@ for i, p in enumerate(portfolio_names, start=1):
 
 # ---------- Admin section ----------
 if is_admin:
+    import io
+    import zipfile
+
+    def build_backup_zip() -> bytes:
+        files = [
+            ("portfolios.csv", PORTFOLIO_PATH),
+            ("transactions.csv", TXN_PATH),
+            ("baseline_lots.csv", BASELINE_PATH),
+        ]
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+            for arcname, path in files:
+                try:
+                    with open(path, "rb") as f:
+                        z.writestr(arcname, f.read())
+                except FileNotFoundError:
+                    z.writestr(arcname, b"")
+        return buf.getvalue()
+
     st.markdown("---")
     st.header("Admin")
 
@@ -1245,7 +1264,7 @@ if is_admin:
                     st.rerun()
 
     # -----------------------
-    # Portfolio Settings tab (RENAMED from "Portfolios")
+    # Portfolio Settings tab
     # -----------------------
     with admin_tabs[1]:
         st.subheader(f"Portfolio settings: {active}")
@@ -1386,14 +1405,19 @@ if is_admin:
 """
         )
 
+    # =========================
+    # Backup download (BOTTOM of Admin section)
+    # =========================
+    st.divider()
+    st.subheader("Backup")
+    st.caption("Download a ZIP containing: portfolios.csv, transactions.csv, baseline_lots.csv")
 
-
-
-
-
-
-
-
+    st.download_button(
+        "⬇️ Download CSV backup (ZIP)",
+        data=build_backup_zip(),
+        file_name=f"portfolio_backup_{date.today().isoformat()}.zip",
+        mime="application/zip",
+    )
 
 
 
