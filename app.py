@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Multi-Portfolio Tracker (Cash + Snapshot)", layout="wide")
 
@@ -240,6 +241,26 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
     px.columns = [str(c).upper() for c in px.columns]
     px = px.sort_index().ffill()
     return px
+
+
+# =========================
+# 2b) Yahoo sector/industry (cached)
+# =========================
+@st.cache_data(ttl=86400)
+def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
+    """
+    Pulls sector/industry from Yahoo via yfinance. Best-effort; may be missing for some tickers.
+    """
+    rows = []
+    for t in sorted(set([str(x).upper().strip() for x in tickers if str(x).strip()])):
+        try:
+            info = yf.Ticker(t).info or {}
+            sector = info.get("sector") or "Unknown"
+            industry = info.get("industry") or "Unknown"
+        except Exception:
+            sector, industry = "Unknown", "Unknown"
+        rows.append({"ticker": t, "sector": sector, "industry": industry})
+    return pd.DataFrame(rows)
 
 
 # =========================
@@ -512,11 +533,11 @@ def compute_nav_series_for_portfolio(
     if not baseline.empty:
         baseline["ticker"] = baseline["ticker"].astype(str).str.upper().str.strip()
 
-    # ✅ FIX: weekly series should still include the start date even if it's not a Monday
+    # Weekly series includes start date even if not Monday
     if chart_freq == "D":
         idx = pd.date_range(start=start, end=end, freq="D")
     else:
-        idx_week = pd.date_range(start=start, end=end, freq=chart_freq)  # e.g. W-MON
+        idx_week = pd.date_range(start=start, end=end, freq=chart_freq)
         idx = pd.DatetimeIndex(sorted(set([start] + list(idx_week))))
 
     if len(idx) == 0:
@@ -600,6 +621,176 @@ def compute_nav_series_for_portfolio(
 
 
 # =========================
+# 4b) Tier-1 analytics helpers
+# =========================
+def compute_drawdown(nav: pd.Series) -> pd.Series:
+    s = nav.dropna().copy()
+    if s.empty:
+        return pd.Series(dtype=float)
+    peak = s.cummax()
+    dd = (s / peak) - 1.0
+    dd.name = "drawdown"
+    return dd
+
+
+def compute_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series) -> dict:
+    """
+    Uses simple returns, aligned on shared dates.
+    Regression form: r_p = alpha + beta * r_m + eps
+    alpha reported annualized (simple compounding) for display.
+    """
+    rp = port_nav.pct_change().replace([np.inf, -np.inf], np.nan)
+    rm = mkt_px.pct_change().replace([np.inf, -np.inf], np.nan)
+
+    df = pd.concat([rp.rename("rp"), rm.rename("rm")], axis=1).dropna()
+    if len(df) < 3:
+        return {"beta": np.nan, "alpha_week": np.nan, "alpha_ann": np.nan, "r2": np.nan, "n": len(df)}
+
+    cov = float(df["rp"].cov(df["rm"]))
+    var = float(df["rm"].var())
+    beta = np.nan if var == 0 else cov / var
+
+    # intercept
+    alpha_week = float(df["rp"].mean() - beta * df["rm"].mean())
+    alpha_ann = float((1.0 + alpha_week) ** 52 - 1.0)  # ok even if you are on daily; it's “weekly-ish” display
+
+    corr = float(df["rp"].corr(df["rm"]))
+    r2 = corr * corr if np.isfinite(corr) else np.nan
+
+    return {"beta": beta, "alpha_week": alpha_week, "alpha_ann": alpha_ann, "r2": r2, "n": len(df)}
+
+
+def rolling_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series, window: int = 26) -> pd.DataFrame:
+    rp = port_nav.pct_change().replace([np.inf, -np.inf], np.nan)
+    rm = mkt_px.pct_change().replace([np.inf, -np.inf], np.nan)
+    df = pd.concat([rp.rename("rp"), rm.rename("rm")], axis=1).dropna()
+    if df.empty or len(df) < window:
+        return pd.DataFrame(columns=["beta", "alpha_ann"])
+
+    betas = []
+    alphas = []
+    idx = []
+    for i in range(window, len(df) + 1):
+        w = df.iloc[i - window : i]
+        cov = float(w["rp"].cov(w["rm"]))
+        var = float(w["rm"].var())
+        beta = np.nan if var == 0 else cov / var
+        alpha_week = float(w["rp"].mean() - beta * w["rm"].mean())
+        alpha_ann = float((1.0 + alpha_week) ** 52 - 1.0)
+        betas.append(beta)
+        alphas.append(alpha_ann)
+        idx.append(w.index[-1])
+
+    out = pd.DataFrame({"beta": betas, "alpha_ann": alphas}, index=pd.to_datetime(idx))
+    return out
+
+
+def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      - sector_alloc_df: columns [label, market_value, weight, sector]
+      - industry_alloc_df: columns [sector, industry, market_value, weight]
+    """
+    rows = []
+
+    # equities
+    if not snap["holdings"].empty:
+        for _, r in snap["holdings"].iterrows():
+            rows.append(
+                {
+                    "ticker": str(r["ticker"]).upper().strip(),
+                    "label": str(r["ticker"]).upper().strip(),
+                    "market_value": float(r["market_value"]),
+                }
+            )
+
+    # cash as its own "position"
+    rows.append({"ticker": "", "label": "CASH", "market_value": float(snap["cash"])})
+
+    df = pd.DataFrame(rows)
+    df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce").fillna(0.0)
+
+    total = float(df["market_value"].sum())
+    if total <= 0:
+        df["weight"] = 0.0
+    else:
+        df["weight"] = df["market_value"] / total
+
+    tickers = sorted([t for t in df["ticker"].unique().tolist() if t])
+    meta = fetch_sector_industry(tickers) if tickers else pd.DataFrame(columns=["ticker", "sector", "industry"])
+
+    df = df.merge(meta, on="ticker", how="left")
+    df.loc[df["label"] == "CASH", "sector"] = "Cash"
+    df.loc[df["label"] == "CASH", "industry"] = "Cash"
+    df["sector"] = df["sector"].fillna("Unknown")
+    df["industry"] = df["industry"].fillna("Unknown")
+
+    # sector-level
+    sector_alloc = (
+        df.groupby(["sector"], as_index=False)
+        .agg(market_value=("market_value", "sum"))
+        .sort_values("market_value", ascending=False)
+    )
+    sector_total = float(sector_alloc["market_value"].sum())
+    sector_alloc["weight"] = np.where(sector_total > 0, sector_alloc["market_value"] / sector_total, 0.0)
+
+    # industry-level (nested within sector)
+    industry_alloc = (
+        df.groupby(["sector", "industry"], as_index=False)
+        .agg(market_value=("market_value", "sum"))
+        .sort_values(["sector", "market_value"], ascending=[True, False])
+    )
+    ind_total = float(industry_alloc["market_value"].sum())
+    industry_alloc["weight"] = np.where(ind_total > 0, industry_alloc["market_value"] / ind_total, 0.0)
+
+    return sector_alloc, industry_alloc
+
+
+def build_contribution_table(snap: dict) -> pd.DataFrame:
+    """
+    Contribution to P&L by ticker:
+      unrealized (open lots) + realized (sales) + dividends (cashflow)
+    Includes a CASH row for unlabeled dividends.
+    """
+    unreal = pd.DataFrame(columns=["ticker", "unrealized_pnl"])
+    if not snap["lots"].empty:
+        unreal = snap["lots"].groupby("ticker", as_index=False).agg(unrealized_pnl=("unrealized_pnl", "sum"))
+
+    realized = pd.DataFrame(columns=["ticker", "realized_pnl"])
+    if not snap["realized"].empty:
+        realized = snap["realized"].groupby("ticker", as_index=False).agg(realized_pnl=("pnl", "sum"))
+
+    divs = pd.DataFrame(columns=["ticker", "dividend_pnl"])
+    tx = snap["filtered_txns"]
+    if tx is not None and not tx.empty:
+        d = tx[tx["type"] == "dividend"].copy()
+        if not d.empty:
+            d["ticker"] = d["ticker"].fillna("").astype(str).str.upper().str.strip()
+            d.loc[d["ticker"] == "", "ticker"] = "CASH"
+            divs = d.groupby("ticker", as_index=False).agg(dividend_pnl=("amount", "sum"))
+
+    out = unreal.merge(realized, on="ticker", how="outer").merge(divs, on="ticker", how="outer")
+    if out.empty:
+        return out
+
+    out = out.fillna(0.0)
+    out["total_contribution"] = out["unrealized_pnl"] + out["realized_pnl"] + out["dividend_pnl"]
+    out = out.sort_values("total_contribution", ascending=False).reset_index(drop=True)
+    return out
+
+
+def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
+    if sector_alloc.empty or sector_alloc["market_value"].sum() <= 0:
+        st.info("No sector allocation available yet.")
+        return
+    fig, ax = plt.subplots()
+    ax.pie(sector_alloc["market_value"], labels=sector_alloc["sector"], autopct="%1.1f%%", startangle=90)
+    ax.set_title(title)
+    ax.axis("equal")
+    st.pyplot(fig, clear_figure=True)
+
+
+# =========================
 # 5) Load data + reconcile
 # =========================
 portfolios_df = load_portfolios()
@@ -644,7 +835,7 @@ st.subheader("Public View (read-only)")
 public_tabs = st.tabs(["Overview"] + portfolio_names)
 
 
-def render_public_portfolio(pname: str):
+def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy_px: pd.Series | None = None):
     meta = get_portfolio_meta(portfolios_df, pname)
     p_txns = txns_all[txns_all["portfolio"] == pname].copy()
     p_base = baseline_all[baseline_all["portfolio"] == pname].copy()
@@ -659,6 +850,7 @@ def render_public_portfolio(pname: str):
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
 
+    # KPIs
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Starting Cash", f"${snap['starting_cash']:,.2f}")
     c2.metric("Cash", f"${snap['cash']:,.2f}")
@@ -669,6 +861,69 @@ def render_public_portfolio(pname: str):
     d1.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
     d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
 
+    # Tier-1 charts
+    st.divider()
+    st.markdown("## Tier 1 Analytics")
+
+    # Sector allocation pie + sector->industry breakdown
+    sector_alloc, industry_alloc = build_allocation_tables(snap)
+    a1, a2 = st.columns([1, 1])
+    with a1:
+        st.markdown("### Sector allocation (incl. cash)")
+        render_sector_pie(sector_alloc, f"{pname} — Sector Allocation")
+        st.dataframe(
+            sector_alloc.assign(weight_pct=(sector_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
+            use_container_width=True,
+        )
+    with a2:
+        st.markdown("### Sector → Industry breakdown (Yahoo Finance)")
+        st.dataframe(
+            industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
+            use_container_width=True,
+        )
+
+    # Contribution to return
+    st.markdown("### Contribution to return (P&L contribution by ticker)")
+    contrib = build_contribution_table(snap)
+    if contrib.empty:
+        st.info("No contribution data yet (need holdings and/or sells/dividends).")
+    else:
+        st.dataframe(contrib, use_container_width=True)
+        # quick chart
+        chart_df = contrib.set_index("ticker")[["total_contribution"]]
+        st.bar_chart(chart_df)
+
+    # Drawdown + Beta/Alpha (if nav_series and spy provided)
+    st.markdown("### Drawdown")
+    if nav_series is None or nav_series.dropna().empty:
+        st.info("No NAV series yet for drawdown.")
+    else:
+        dd = compute_drawdown(nav_series)
+        st.line_chart(dd)
+
+    st.markdown("### Beta / Alpha vs SPY")
+    if nav_series is None or spy_px is None or nav_series.dropna().empty or spy_px.dropna().empty:
+        st.info("Beta/alpha need both portfolio NAV series and benchmark series.")
+    else:
+        stats = compute_beta_alpha(nav_series, spy_px)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Beta", f"{stats['beta']:.2f}" if np.isfinite(stats["beta"]) else "—")
+        k2.metric("Alpha (annualized)", f"{stats['alpha_ann']*100:.2f}%" if np.isfinite(stats["alpha_ann"]) else "—")
+        k3.metric("R²", f"{stats['r2']:.2f}" if np.isfinite(stats["r2"]) else "—")
+        k4.metric("Obs", f"{stats['n']}")
+
+        roll = rolling_beta_alpha(nav_series, spy_px, window=26)
+        if not roll.empty:
+            r1, r2 = st.columns(2)
+            with r1:
+                st.caption("Rolling beta (26 periods)")
+                st.line_chart(roll[["beta"]])
+            with r2:
+                st.caption("Rolling alpha (annualized, 26 periods)")
+                st.line_chart(roll[["alpha_ann"]])
+
+    # Existing tables
+    st.divider()
     if not snap["holdings"].empty:
         st.markdown("### Holdings")
         st.dataframe(snap["holdings"], use_container_width=True)
@@ -701,7 +956,7 @@ with public_tabs[0]:
     st.markdown("## Overview")
 
     end_date = pd.to_datetime(date.today())
-    nav_series = {}
+    nav_series_map = {}
     cash_now_by_port = {}
     pnl_now_by_port = {}
 
@@ -714,7 +969,7 @@ with public_tabs[0]:
         cash_now_by_port[p] = snap["cash"]
         pnl_now_by_port[p] = snap["realized_pnl"] + snap["unrealized_pnl"]
 
-        nav_series[p] = compute_nav_series_for_portfolio(
+        nav_series_map[p] = compute_nav_series_for_portfolio(
             pname=p,
             meta=meta,
             txns_all=txns_all,
@@ -723,9 +978,8 @@ with public_tabs[0]:
             chart_freq=chart_freq,
         )
 
-    nav_df = pd.DataFrame(nav_series).sort_index()
+    nav_df = pd.DataFrame(nav_series_map).sort_index()
 
-    # ✅ Aggregate NAV should reflect latest available NAVs
     if nav_df.empty:
         agg_nav_last = 0.0
         agg_nav = pd.Series(dtype=float)
@@ -744,11 +998,12 @@ with public_tabs[0]:
     st.divider()
 
     earliest = None
-    for s in nav_series.values():
+    for s in nav_series_map.values():
         fv = s.first_valid_index()
         if fv is not None:
             earliest = fv if earliest is None else min(earliest, fv)
 
+    spy = pd.Series(dtype=float)
     if earliest is None or nav_df.empty:
         st.info("Add at least one portfolio with data to see charts.")
     else:
@@ -760,12 +1015,12 @@ with public_tabs[0]:
             else:
                 spy = spy_daily.reindex(pd.date_range(earliest, end_date, freq="D")).ffill()
                 spy = spy.reindex(nav_df.index).ffill()
-            spy = index_to_100(spy)
+            spy = spy.astype(float)
         else:
             spy = pd.Series(index=nav_df.index, dtype=float)
 
         rel = pd.DataFrame({p: index_to_100(nav_df[p]) for p in nav_df.columns})
-        rel["SPY"] = spy
+        rel["SPY"] = index_to_100(spy) if not spy.empty else spy
 
         st.markdown(f"### Relative performance (Indexed to 100 at series start) — {freq_choice}")
         st.line_chart(rel)
@@ -773,6 +1028,11 @@ with public_tabs[0]:
         if not agg_nav.empty:
             st.markdown(f"### Aggregate growth (Indexed) — {freq_choice}")
             st.line_chart(index_to_100(agg_nav))
+
+        st.markdown("### Aggregate drawdown")
+        dd_agg = compute_drawdown(agg_nav)
+        if not dd_agg.empty:
+            st.line_chart(dd_agg)
 
     st.divider()
 
@@ -794,7 +1054,7 @@ with public_tabs[0]:
                 st.metric("Cash", f"${snap['cash']:,.2f}")
                 st.metric("Total P&L", f"${(snap['realized_pnl'] + snap['unrealized_pnl']):,.2f}")
 
-                nav = nav_series.get(p)
+                nav = nav_series_map.get(p)
                 if nav is not None and not nav.empty:
                     st.line_chart(index_to_100(nav))
                 else:
@@ -803,153 +1063,88 @@ with public_tabs[0]:
 # ----------------------------
 # Individual portfolio tabs
 # ----------------------------
+# Build a single SPY series aligned to each portfolio at render time
 for i, p in enumerate(portfolio_names, start=1):
     with public_tabs[i]:
         st.markdown(f"## {p}")
-        render_public_portfolio(p)
+
+        nav = nav_series_map.get(p)
+        spy_aligned = None
+        if nav is not None and not nav.dropna().empty:
+            s0 = nav.first_valid_index()
+            s1 = nav.last_valid_index()
+            if s0 is not None and s1 is not None:
+                spy_px = fetch_price_history(["SPY"], s0, s1)
+                if not spy_px.empty:
+                    spy_daily = spy_px["SPY"].copy()
+                    if chart_freq == "D":
+                        spy_aligned = spy_daily.reindex(nav.index).ffill()
+                    else:
+                        spy_aligned = spy_daily.reindex(pd.date_range(s0, s1, freq="D")).ffill()
+                        spy_aligned = spy_aligned.reindex(nav.index).ffill()
+
+        render_public_portfolio(p, nav_series=nav, spy_px=spy_aligned)
 
 # ---------- Admin section ----------
 if is_admin:
     st.markdown("---")
     st.header("Admin")
 
+    # =========================
+    # Create portfolio (TOP)
+    # =========================
+    st.subheader("Create portfolio")
+    with st.form("create_portfolio_form", clear_on_submit=True):
+        new_name = st.text_input("Name", placeholder="e.g., Long Only, Trading, IRA")
+        new_mode = st.selectbox("Start mode", VALID_MODES, index=0)
+        new_asof = st.date_input("As-of date", value=date.today())
+        new_cash = st.number_input("Starting cash ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
+        submitted = st.form_submit_button("Add portfolio")
+
+    if submitted:
+        name = _clean_str(new_name)
+        if not name:
+            st.error("Enter a portfolio name.")
+        elif name in set(portfolio_names):
+            st.warning("That portfolio already exists.")
+        else:
+            portfolios_df = pd.concat(
+                [
+                    portfolios_df,
+                    pd.DataFrame(
+                        [
+                            {
+                                "portfolio": name,
+                                "start_mode": new_mode,
+                                "as_of_date": pd.to_datetime(new_asof),
+                                "starting_cash": float(new_cash),
+                            }
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+            save_portfolios(portfolios_df)
+            st.success("Portfolio added.")
+            st.rerun()
+
+    st.divider()
+
+    # =========================
+    # Active portfolio selector (BELOW create)
+    # =========================
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
-    admin_tabs = st.tabs(["Portfolios", "Baseline lots", "Transactions", "Documentation"])
+    # =========================
+    # Tabs (Transactions FIRST = default)
+    # =========================
+    admin_tabs = st.tabs(["Transactions", "Portfolio Settings", "Baseline lots", "Documentation"])
 
     # -----------------------
-    # Portfolios tab
+    # Transactions tab (DEFAULT)
     # -----------------------
     with admin_tabs[0]:
-        st.subheader("Create portfolio")
-        with st.form("create_portfolio_form", clear_on_submit=True):
-            new_name = st.text_input("Name", placeholder="e.g., Long Only, Trading, IRA")
-            new_mode = st.selectbox("Start mode", VALID_MODES, index=0)
-            new_asof = st.date_input("As-of date", value=date.today())
-            new_cash = st.number_input("Starting cash ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
-            submitted = st.form_submit_button("Add portfolio")
-
-        if submitted:
-            name = _clean_str(new_name)
-            if not name:
-                st.error("Enter a portfolio name.")
-            elif name in set(portfolio_names):
-                st.warning("That portfolio already exists.")
-            else:
-                portfolios_df = pd.concat(
-                    [
-                        portfolios_df,
-                        pd.DataFrame(
-                            [
-                                {
-                                    "portfolio": name,
-                                    "start_mode": new_mode,
-                                    "as_of_date": pd.to_datetime(new_asof),
-                                    "starting_cash": float(new_cash),
-                                }
-                            ]
-                        ),
-                    ],
-                    ignore_index=True,
-                )
-                save_portfolios(portfolios_df)
-                st.success("Portfolio added.")
-                st.rerun()
-
-        st.divider()
-        st.subheader(f"Edit settings: {active}")
-
-        with st.form("edit_portfolio_form"):
-            mode_u = st.selectbox("Start mode", VALID_MODES, index=VALID_MODES.index(meta["start_mode"]))
-            asof_u = st.date_input("As-of date", value=meta["as_of_date"].date())
-            cash_u = st.number_input(
-                "Starting cash ($)",
-                min_value=0.0,
-                value=float(meta["starting_cash"]),
-                step=100.0,
-                format="%.2f",
-            )
-            saved = st.form_submit_button("Save settings")
-
-        if saved:
-            portfolios_df.loc[portfolios_df["portfolio"] == active, "start_mode"] = mode_u
-            portfolios_df.loc[portfolios_df["portfolio"] == active, "as_of_date"] = pd.to_datetime(asof_u)
-            portfolios_df.loc[portfolios_df["portfolio"] == active, "starting_cash"] = float(cash_u)
-            save_portfolios(portfolios_df)
-            st.success("Saved.")
-            st.rerun()
-
-    # -----------------------
-    # Baseline lots tab
-    # -----------------------
-    with admin_tabs[1]:
-        st.subheader("Baseline lots (snapshot portfolios only)")
-
-        if meta["start_mode"] != "snapshot_start":
-            st.info("This portfolio is ledger-complete. Baseline lots are only used for snapshot-start portfolios.")
-        else:
-            with st.form("add_baseline_form", clear_on_submit=True):
-                c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
-                with c1:
-                    bl_ticker = st.text_input("Ticker", value="AAPL")
-                with c2:
-                    bl_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
-                with c3:
-                    bl_price = st.number_input("Cost basis (price)", min_value=0.0, value=100.00, step=0.01, format="%.2f")
-                with c4:
-                    bl_date = st.date_input("Acquisition date", value=date.today())
-
-                add_bl = st.form_submit_button("Add baseline lot")
-
-            if add_bl:
-                row = {
-                    "lot_id": str(pd.Timestamp.utcnow().value),
-                    "portfolio": active,
-                    "ticker": _clean_str(bl_ticker).upper(),
-                    "buy_date": pd.to_datetime(bl_date),
-                    "buy_price": float(bl_price),
-                    "shares_open": float(round(bl_shares, 3)),
-                }
-                baseline_all = pd.concat([baseline_all, pd.DataFrame([row])], ignore_index=True)
-                save_baseline(baseline_all)
-                st.success("Baseline lot added.")
-                st.rerun()
-
-            st.divider()
-            st.write("Current baseline lots")
-            p_base = baseline_all[baseline_all["portfolio"] == active].copy()
-
-            if p_base.empty:
-                st.info("No baseline lots yet.")
-            else:
-                st.dataframe(p_base.sort_values(["ticker", "buy_date"]), use_container_width=True)
-
-                p_base_disp = p_base.copy()
-                p_base_disp["display"] = (
-                    pd.to_datetime(p_base_disp["buy_date"]).dt.date.astype(str)
-                    + " | "
-                    + p_base_disp["ticker"]
-                    + " | "
-                    + p_base_disp["shares_open"].map(lambda x: f"{x:.3f}")
-                    + " @ "
-                    + p_base_disp["buy_price"].map(lambda x: f"{x:.2f}")
-                    + " | id="
-                    + p_base_disp["lot_id"].astype(str)
-                )
-                choice = st.selectbox("Select baseline lot to delete", p_base_disp["display"].tolist())
-                chosen_id = choice.split("id=")[-1].strip()
-
-                if st.button("Delete baseline lot"):
-                    baseline_all = baseline_all[baseline_all["lot_id"].astype(str) != chosen_id].copy()
-                    save_baseline(baseline_all)
-                    st.warning("Deleted baseline lot.")
-                    st.rerun()
-
-    # -----------------------
-    # Transactions tab
-    # -----------------------
-    with admin_tabs[2]:
         st.subheader("Transactions")
 
         with st.form("add_txn_form", clear_on_submit=True):
@@ -970,7 +1165,9 @@ if is_admin:
                 with c1:
                     t_ticker = st.text_input("Ticker (optional)", value="")
                 with c2:
-                    t_amount = st.number_input("Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+                    t_amount = st.number_input(
+                        "Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f"
+                    )
                 t_shares = np.nan
                 t_price = np.nan
 
@@ -1048,6 +1245,100 @@ if is_admin:
                     st.rerun()
 
     # -----------------------
+    # Portfolio Settings tab (RENAMED from "Portfolios")
+    # -----------------------
+    with admin_tabs[1]:
+        st.subheader(f"Portfolio settings: {active}")
+
+        with st.form("edit_portfolio_form"):
+            mode_u = st.selectbox("Start mode", VALID_MODES, index=VALID_MODES.index(meta["start_mode"]))
+            asof_u = st.date_input("As-of date", value=meta["as_of_date"].date())
+            cash_u = st.number_input(
+                "Starting cash ($)",
+                min_value=0.0,
+                value=float(meta["starting_cash"]),
+                step=100.0,
+                format="%.2f",
+            )
+            saved = st.form_submit_button("Save settings")
+
+        if saved:
+            portfolios_df.loc[portfolios_df["portfolio"] == active, "start_mode"] = mode_u
+            portfolios_df.loc[portfolios_df["portfolio"] == active, "as_of_date"] = pd.to_datetime(asof_u)
+            portfolios_df.loc[portfolios_df["portfolio"] == active, "starting_cash"] = float(cash_u)
+            save_portfolios(portfolios_df)
+            st.success("Saved.")
+            st.rerun()
+
+    # -----------------------
+    # Baseline lots tab
+    # -----------------------
+    with admin_tabs[2]:
+        st.subheader("Baseline lots (snapshot portfolios only)")
+
+        if meta["start_mode"] != "snapshot_start":
+            st.info("This portfolio is ledger-complete. Baseline lots are only used for snapshot-start portfolios.")
+        else:
+            with st.form("add_baseline_form", clear_on_submit=True):
+                c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+                with c1:
+                    bl_ticker = st.text_input("Ticker", value="AAPL")
+                with c2:
+                    bl_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
+                with c3:
+                    bl_price = st.number_input(
+                        "Cost basis (price)", min_value=0.0, value=100.00, step=0.01, format="%.2f"
+                    )
+                with c4:
+                    bl_date = st.date_input("Acquisition date", value=date.today())
+
+                add_bl = st.form_submit_button("Add baseline lot")
+
+            if add_bl:
+                row = {
+                    "lot_id": str(pd.Timestamp.utcnow().value),
+                    "portfolio": active,
+                    "ticker": _clean_str(bl_ticker).upper(),
+                    "buy_date": pd.to_datetime(bl_date),
+                    "buy_price": float(bl_price),
+                    "shares_open": float(round(bl_shares, 3)),
+                }
+                baseline_all = pd.concat([baseline_all, pd.DataFrame([row])], ignore_index=True)
+                save_baseline(baseline_all)
+                st.success("Baseline lot added.")
+                st.rerun()
+
+            st.divider()
+            st.write("Current baseline lots")
+            p_base = baseline_all[baseline_all["portfolio"] == active].copy()
+
+            if p_base.empty:
+                st.info("No baseline lots yet.")
+            else:
+                st.dataframe(p_base.sort_values(["ticker", "buy_date"]), use_container_width=True)
+
+                p_base_disp = p_base.copy()
+                p_base_disp["display"] = (
+                    pd.to_datetime(p_base_disp["buy_date"]).dt.date.astype(str)
+                    + " | "
+                    + p_base_disp["ticker"]
+                    + " | "
+                    + p_base_disp["shares_open"].map(lambda x: f"{x:.3f}")
+                    + " @ "
+                    + p_base_disp["buy_price"].map(lambda x: f"{x:.2f}")
+                    + " | id="
+                    + p_base_disp["lot_id"].astype(str)
+                )
+                choice = st.selectbox("Select baseline lot to delete", p_base_disp["display"].tolist())
+                chosen_id = choice.split("id=")[-1].strip()
+
+                if st.button("Delete baseline lot"):
+                    baseline_all = baseline_all[baseline_all["lot_id"].astype(str) != chosen_id].copy()
+                    save_baseline(baseline_all)
+                    st.warning("Deleted baseline lot.")
+                    st.rerun()
+
+    # -----------------------
     # Documentation tab
     # -----------------------
     with admin_tabs[3]:
@@ -1057,12 +1348,12 @@ if is_admin:
 ### Quick start
 
 **If you have full history (ledger-complete):**
-1. Go to **Portfolios** → set **Start mode** = `ledger_complete`
+1. Go to **Portfolio Settings** → set **Start mode** = `ledger_complete`
 2. Set **Starting cash** (cash at the beginning of your ledger)
 3. Enter **all buys/sells/dividends** in **Transactions**
 
 **If you only have today's holdings (snapshot-start):**
-1. Go to **Portfolios** → set **Start mode** = `snapshot_start`
+1. Go to **Portfolio Settings** → set **Start mode** = `snapshot_start`
 2. Set **As-of date** = the snapshot boundary (usually today)
 3. Set **Starting cash** = cash in the account on the as-of date
 4. Go to **Baseline lots** → add each holding with:
@@ -1076,7 +1367,7 @@ if is_admin:
 
 ### Charting notes
 - Charts start at the portfolio **As-of date** (no line before the start date).
-- Weekly mode samples on **Mondays**, but always includes the start date (fix for empty-week issue).
+- Weekly mode samples on **Mondays**, but always includes the start date.
 
 ---
 
@@ -1095,7 +1386,59 @@ if is_admin:
 """
         )
 
-st.caption(
-    "Files used: portfolios.csv, baseline_lots.csv, transactions.csv. "
-    "Snapshot portfolios track from as-of date forward; baseline lots represent holdings at the boundary."
-)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
