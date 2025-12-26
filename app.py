@@ -1036,30 +1036,6 @@ with public_tabs[0]:
 
     st.divider()
 
-    st.markdown("## Portfolios")
-    if not portfolio_names:
-        st.write("No portfolios yet.")
-    else:
-        cols = st.columns(len(portfolio_names))
-        for i, p in enumerate(portfolio_names):
-            with cols[i]:
-                meta = get_portfolio_meta(portfolios_df, p)
-                p_txns = txns_all[txns_all["portfolio"] == p].copy()
-                p_base = baseline_all[baseline_all["portfolio"] == p].copy()
-                snap = portfolio_snapshot(meta, p_txns, p_base, match_method)
-
-                st.markdown(f"### {p}")
-                st.caption(f"Start date: {pd.to_datetime(meta['as_of_date']).date()}")
-                st.metric("NAV", f"${snap['nav']:,.2f}")
-                st.metric("Cash", f"${snap['cash']:,.2f}")
-                st.metric("Total P&L", f"${(snap['realized_pnl'] + snap['unrealized_pnl']):,.2f}")
-
-                nav = nav_series_map.get(p)
-                if nav is not None and not nav.empty:
-                    st.line_chart(index_to_100(nav))
-                else:
-                    st.write("No data yet.")
-
 # ----------------------------
 # Individual portfolio tabs
 # ----------------------------
