@@ -203,9 +203,6 @@ def save_baseline(df: pd.DataFrame) -> None:
     out.to_csv(BASELINE_PATH, index=False)
 
 
-# =========================
-# 2a) Yahoo price helpers
-# =========================
 @st.cache_data(ttl=600)
 def fetch_last_prices(tickers: list[str]) -> pd.Series:
     if not tickers:
@@ -246,46 +243,6 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
     return px
 
 
-@st.cache_data(ttl=3600)
-def fetch_close_on_or_before(ticker: str, dt: pd.Timestamp) -> float:
-    """
-    Best-effort "recommended" close price for a transaction date.
-    If the market was closed on dt, uses the most recent prior trading day's close.
-    """
-    t = str(ticker).upper().strip()
-    if not t:
-        return float("nan")
-
-    d = pd.to_datetime(dt).normalize()
-    start = (d - pd.Timedelta(days=10)).date()
-    end = (d + pd.Timedelta(days=1)).date()
-
-    try:
-        data = yf.download([t], start=start, end=end, interval="1d", auto_adjust=True, progress=False)
-    except Exception:
-        return float("nan")
-
-    if data is None or len(data) == 0:
-        return float("nan")
-
-    close = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data["Close"]
-    close = close.dropna()
-    if close.empty:
-        return float("nan")
-
-    close.index = pd.to_datetime(close.index).normalize()
-
-    # exact date
-    if d in close.index:
-        return float(close.loc[d])
-
-    # prior date
-    prior = close[close.index <= d]
-    if prior.empty:
-        return float("nan")
-    return float(prior.iloc[-1])
-
-
 # =========================
 # 2b) Yahoo sector/industry (cached)
 # =========================
@@ -304,57 +261,66 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 
 
 # =========================
-# 2c) Yahoo dividends (cached) — FIXED tz/dtype comparisons
+# 2c) Price recommendation for transactions (Close on date, or prior trading day)
 # =========================
 @st.cache_data(ttl=86400)
-def fetch_dividend_events(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+def fetch_recommended_close(ticker: str, tx_date: date) -> float | None:
     """
-    Returns dividend-per-share series for [start, end].
-    Normalizes timezone issues and dtype mismatches from Yahoo/yfinance.
+    Returns the close price on tx_date if trading day; otherwise most recent prior trading day's close.
+    Best-effort via yfinance.
+    """
+    t = str(ticker).upper().strip()
+    if not t:
+        return None
+
+    d = pd.to_datetime(tx_date).normalize()
+    start = (d - pd.Timedelta(days=10)).date()
+    end = (d + pd.Timedelta(days=1)).date()
+
+    try:
+        df = yf.download([t], start=start, end=end, interval="1d", auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            return None
+
+        close = df["Close"] if "Close" in df.columns else None
+        if close is None:
+            return None
+
+        close.index = pd.to_datetime(close.index).normalize()
+        close = close.dropna()
+        if close.empty:
+            return None
+
+        eligible = close[close.index <= d]
+        if eligible.empty:
+            return None
+
+        return float(eligible.iloc[-1])
+    except Exception:
+        return None
+
+
+# =========================
+# 2d) Yahoo dividends history (per share)
+# =========================
+@st.cache_data(ttl=86400)
+def fetch_yahoo_dividends_per_share(ticker: str) -> pd.Series:
+    """
+    Returns a Series indexed by date (normalized) of dividend per share.
+    yfinance provides "dividends" history; best-effort.
     """
     t = str(ticker).upper().strip()
     if not t:
         return pd.Series(dtype=float)
-
-    start_ts = pd.to_datetime(start, errors="coerce")
-    end_ts = pd.to_datetime(end, errors="coerce")
-    if pd.isna(start_ts) or pd.isna(end_ts):
-        return pd.Series(dtype=float)
-
-    # Make tz-naive
-    try:
-        start_ts = start_ts.tz_localize(None)
-    except Exception:
-        pass
-    try:
-        end_ts = end_ts.tz_localize(None)
-    except Exception:
-        pass
-
-    start_ts = start_ts.normalize()
-    end_ts = end_ts.normalize()
-
     try:
         div = yf.Ticker(t).dividends
+        if div is None or len(div) == 0:
+            return pd.Series(dtype=float)
+        div.index = pd.to_datetime(div.index).normalize()
+        div = div.astype(float).sort_index()
+        return div
     except Exception:
         return pd.Series(dtype=float)
-
-    if div is None or len(div) == 0:
-        return pd.Series(dtype=float)
-
-    idx = pd.to_datetime(div.index, errors="coerce")
-    idx = pd.DatetimeIndex(idx)
-    try:
-        idx = idx.tz_localize(None)
-    except Exception:
-        pass
-
-    div = pd.Series(div.values, index=idx).sort_index()
-    div = div[div.index.notna()]
-    div.index = div.index.normalize()
-
-    div = div[(div.index >= start_ts) & (div.index <= end_ts)]
-    return div.astype(float)
 
 
 # =========================
@@ -587,7 +553,7 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 
 
 # =========================
-# 4) Chart helpers (WEEKLY/Daily) + FIXED weekly index
+# 4) Chart helpers (WEEKLY/Daily)
 # =========================
 def _portfolio_start_date(meta: dict) -> pd.Timestamp:
     return pd.to_datetime(meta["as_of_date"]).normalize()
@@ -615,19 +581,16 @@ def compute_nav_series_for_portfolio(
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
-    # Portfolio txns
     txns = txns_all[txns_all["portfolio"] == pname].copy()
     if not txns.empty:
         txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
         txns = txns.sort_values(["date", "txn_id"])
         txns = txns[txns["date"] >= start].copy()
 
-    # Portfolio baseline
     baseline = baseline_all[baseline_all["portfolio"] == pname].copy()
     if not baseline.empty:
         baseline["ticker"] = baseline["ticker"].astype(str).str.upper().str.strip()
 
-    # Weekly series includes start date even if not Monday
     if chart_freq == "D":
         idx = pd.date_range(start=start, end=end, freq="D")
     else:
@@ -792,7 +755,7 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce").fillna(0.0)
 
     total = float(df["market_value"].sum())
-    df["weight"] = 0.0 if total <= 0 else df["market_value"] / total
+    df["weight"] = (df["market_value"] / total) if total > 0 else 0.0
 
     tickers = sorted([t for t in df["ticker"].unique().tolist() if t])
     meta = fetch_sector_industry(tickers) if tickers else pd.DataFrame(columns=["ticker", "sector", "industry"])
@@ -862,77 +825,23 @@ def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
 
 
 # =========================
-# 4c) Dividend tracker (estimated from Yahoo)
+# 4c) Dividend tracker helpers
 # =========================
-@st.cache_data(ttl=3600)
-def compute_shares_history(
-    pname: str,
-    meta: dict,
-    txns_all: pd.DataFrame,
-    baseline_all: pd.DataFrame,
-    end: pd.Timestamp,
-    freq: str = "D",
-) -> pd.DataFrame:
-    """
-    Returns shares outstanding by ticker over time index.
-    Includes baseline shares at start (as-of date).
-    Trades after start affect shares.
-    """
-    start = _portfolio_start_date(meta)
-    end = pd.to_datetime(end).normalize()
+def _start_end_for_portfolio(meta: dict, txns: pd.DataFrame, baseline: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
+    start = pd.to_datetime(meta["as_of_date"]).normalize()
+    end = pd.to_datetime(date.today()).normalize()
 
-    txns = txns_all[txns_all["portfolio"] == pname].copy()
+    # If there are txns later than today (rare), use that
     if not txns.empty:
-        txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
-        txns = txns.sort_values(["date", "txn_id"])
-        txns = txns[txns["date"] >= start].copy()
-        txns = txns[txns["type"].isin(["buy", "sell"])].copy()
+        tmax = pd.to_datetime(txns["date"]).max()
+        if pd.notna(tmax):
+            end = max(end, pd.to_datetime(tmax).normalize())
 
-    baseline = baseline_all[baseline_all["portfolio"] == pname].copy()
-    baseline_shares = {}
-    if not baseline.empty:
-        baseline["ticker"] = baseline["ticker"].astype(str).str.upper().str.strip()
-        for _, r in baseline.iterrows():
-            t = str(r["ticker"]).upper().strip()
-            baseline_shares[t] = baseline_shares.get(t, 0.0) + float(r["shares_open"])
-
-    tickers = set(baseline_shares.keys())
-    if not txns.empty:
-        txns["ticker"] = txns["ticker"].astype(str).str.upper().str.strip()
-        tickers.update([t for t in txns["ticker"].unique().tolist() if t])
-    tickers = sorted([t for t in tickers if t])
-
-    if freq == "D":
-        idx = pd.date_range(start=start, end=end, freq="D")
-    else:
-        idx = pd.date_range(start=start, end=end, freq=freq)
-
-    if not tickers:
-        return pd.DataFrame(index=idx)
-
-    shares = pd.DataFrame(0.0, index=idx, columns=tickers)
-
-    # baseline injected at start
-    for t, sh in baseline_shares.items():
-        if t in shares.columns:
-            shares.loc[idx[0], t] += sh
-
-    if not txns.empty:
-        txns["signed"] = np.where(txns["type"] == "buy", txns["shares"], -txns["shares"])
-        for t in tickers:
-            sub = txns[txns["ticker"] == t]
-            if sub.empty:
-                continue
-            d_by_day = sub.groupby("date")["signed"].sum()
-            shares[t] += d_by_day.reindex(idx, fill_value=0.0)
-
-    shares = shares.cumsum()
-    shares[shares < 0] = 0.0
-    return shares
+    # If baseline has earlier buy_date (snapshot lots acquired earlier), we still start at as_of boundary
+    return start, end
 
 
-@st.cache_data(ttl=3600)
-def estimate_dividends_for_portfolio(
+def compute_shares_held_daily(
     pname: str,
     meta: dict,
     txns_all: pd.DataFrame,
@@ -941,213 +850,197 @@ def estimate_dividends_for_portfolio(
     end: pd.Timestamp,
 ) -> pd.DataFrame:
     """
-    Estimate cash dividends from Yahoo dividend-per-share events.
-    Assumes you receive dividend for shares held on the event date (end-of-day approximation).
-    Returns per-ticker totals + event-level table.
+    Daily shares held per ticker (best-effort), used for Yahoo dividend estimation.
+    Includes baseline shares injected at start date.
+    Applies only txns on/after start boundary.
     """
-    start = pd.to_datetime(start).normalize()
-    end = pd.to_datetime(end).normalize()
+    txns = txns_all[txns_all["portfolio"] == pname].copy()
+    if not txns.empty:
+        txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
+        txns = txns.sort_values(["date", "txn_id"])
+        txns = txns[txns["date"] >= start].copy()
 
-    shares_daily = compute_shares_history(pname, meta, txns_all, baseline_all, end=end, freq="D")
-    if shares_daily.empty or shares_daily.shape[1] == 0:
-        return pd.DataFrame(columns=["Ticker", "Estimated Dividends ($)"])
+    baseline = baseline_all[baseline_all["portfolio"] == pname].copy()
+    baseline_shares = {}
+    if not baseline.empty:
+        for _, r in baseline.iterrows():
+            t = str(r["ticker"]).upper().strip()
+            baseline_shares[t] = baseline_shares.get(t, 0.0) + float(r["shares_open"])
 
-    tickers = list(shares_daily.columns)
+    trades = txns[txns["type"].isin(["buy", "sell"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
+    tickers = set(baseline_shares.keys())
+
+    if not trades.empty:
+        trades["ticker"] = trades["ticker"].astype(str).str.upper().str.strip()
+        trades["signed_shares"] = np.where(trades["type"] == "buy", trades["shares"], -trades["shares"])
+        tickers.update([t for t in trades["ticker"].unique() if t])
+
+    tickers = sorted([t for t in tickers if t])
+    idx = pd.date_range(start=start, end=end, freq="D")
+    if not tickers:
+        return pd.DataFrame(index=idx)
+
+    shares = pd.DataFrame(0.0, index=idx, columns=tickers)
+
+    # baseline injection at boundary
+    for t, sh in baseline_shares.items():
+        if t in shares.columns:
+            shares.loc[idx[0], t] += sh
+
+    # trades daily deltas
+    if not trades.empty:
+        for t in tickers:
+            t_tr = trades[trades["ticker"] == t]
+            if t_tr.empty:
+                continue
+            delta_by_day = t_tr.groupby("date")["signed_shares"].sum()
+            shares[t] += delta_by_day.reindex(idx, fill_value=0.0)
+
+    shares = shares.cumsum()
+    return shares
+
+
+def build_manual_dividends_df(p_txns: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    df = p_txns.copy()
+    if df.empty:
+        return pd.DataFrame(columns=["date", "ticker", "amount", "source"])
+
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+
+    # honor snapshot boundary
+    if meta["start_mode"] == "snapshot_start":
+        df = df[df["date"] >= pd.to_datetime(meta["as_of_date"]).normalize()].copy()
+
+    d = df[df["type"] == "dividend"].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["date", "ticker", "amount", "source"])
+
+    d["ticker"] = d["ticker"].fillna("").astype(str).str.upper().str.strip()
+    d.loc[d["ticker"] == "", "ticker"] = "CASH"
+    d["amount"] = pd.to_numeric(d["amount"], errors="coerce").fillna(0.0)
+    d = d[d["amount"] >= 0].copy()
+    d = d[["date", "ticker", "amount"]].copy()
+    d["source"] = "manual"
+    return d
+
+
+def build_estimated_dividends_df(
+    pname: str,
+    meta: dict,
+    txns_all: pd.DataFrame,
+    baseline_all: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Best-effort: estimated cash dividends using Yahoo 'dividends per share'
+    multiplied by shares held on that date.
+    """
+    start, end = _start_end_for_portfolio(meta, txns_all[txns_all["portfolio"] == pname], baseline_all[baseline_all["portfolio"] == pname])
+    shares_daily = compute_shares_held_daily(pname, meta, txns_all, baseline_all, start=start, end=end)
+    if shares_daily.empty:
+        return pd.DataFrame(columns=["date", "ticker", "amount", "source"])
+
+    tickers = [c for c in shares_daily.columns if c]
+    if not tickers:
+        return pd.DataFrame(columns=["date", "ticker", "amount", "source"])
+
     rows = []
-
     for t in tickers:
-        div_ps = fetch_dividend_events(t, start, end)
+        div_ps = fetch_yahoo_dividends_per_share(t)
         if div_ps.empty:
             continue
 
-        # align shares on event dates; if missing (holiday/weekend), use prior day
-        sh = shares_daily[t].copy()
-        sh = sh.reindex(pd.date_range(sh.index.min(), sh.index.max(), freq="D")).ffill()
-        for evt_dt, dps in div_ps.items():
-            evt_dt = pd.to_datetime(evt_dt).normalize()
-            if evt_dt < start or evt_dt > end:
-                continue
-            if evt_dt not in sh.index:
-                continue
-            cash_amt = float(sh.loc[evt_dt]) * float(dps)
-            if cash_amt != 0:
-                rows.append({"date": evt_dt, "ticker": t, "div_per_share": float(dps), "shares": float(sh.loc[evt_dt]), "cash": cash_amt})
+        # restrict to boundary window
+        div_ps = div_ps[(div_ps.index >= start) & (div_ps.index <= end)].copy()
+        if div_ps.empty:
+            continue
+
+        # shares held on dividend date
+        sh = shares_daily[t].reindex(div_ps.index).ffill().fillna(0.0)
+
+        # amount = div per share * shares held
+        amt = (div_ps * sh).astype(float)
+
+        for dt, a in amt.items():
+            if a > 1e-12:
+                rows.append({"date": pd.to_datetime(dt).normalize(), "ticker": t, "amount": float(a), "source": "yahoo_est"})
 
     if not rows:
-        return pd.DataFrame(columns=["Ticker", "Estimated Dividends ($)"])
+        return pd.DataFrame(columns=["date", "ticker", "amount", "source"])
 
-    ev = pd.DataFrame(rows).sort_values(["date", "ticker"])
-    by_t = ev.groupby("ticker", as_index=False).agg(estimated_dividends=("cash", "sum"))
-    by_t = by_t.rename(columns={"ticker": "Ticker", "estimated_dividends": "Estimated Dividends ($)"})
-    by_t = by_t.sort_values("Estimated Dividends ($)", ascending=False).reset_index(drop=True)
-    return by_t
+    out = pd.DataFrame(rows)
+    out = out.sort_values(["date", "ticker"]).reset_index(drop=True)
+    return out
+
+
+def render_dividend_tracker(
+    pname: str,
+    meta: dict,
+    p_txns: pd.DataFrame,
+    txns_all: pd.DataFrame,
+    baseline_all: pd.DataFrame,
+    include_estimated: bool,
+):
+    st.markdown("## Dividends")
+
+    manual = build_manual_dividends_df(p_txns, meta)
+    est = build_estimated_dividends_df(pname, meta, txns_all, baseline_all) if include_estimated else pd.DataFrame(columns=["date", "ticker", "amount", "source"])
+
+    # Avoid double counting: if manual exists for same (date,ticker), prefer manual
+    if not manual.empty and not est.empty:
+        manual_keys = set((r["date"], r["ticker"]) for _, r in manual.iterrows())
+        est = est[~est.apply(lambda r: (r["date"], r["ticker"]) in manual_keys, axis=1)].copy()
+
+    combined = pd.concat([manual, est], ignore_index=True)
+    if combined.empty:
+        st.info("No dividend data yet. Add dividend transactions, or enable Yahoo-estimated dividends.")
+        return
+
+    combined["date"] = pd.to_datetime(combined["date"]).dt.normalize()
+    combined["amount"] = pd.to_numeric(combined["amount"], errors="coerce").fillna(0.0)
+
+    today = pd.to_datetime(date.today()).normalize()
+    ytd_start = pd.Timestamp(year=today.year, month=1, day=1)
+    ttm_start = today - pd.Timedelta(days=365)
+
+    manual_total = float(manual["amount"].sum()) if not manual.empty else 0.0
+    est_total = float(est["amount"].sum()) if not est.empty else 0.0
+    total_all = float(combined["amount"].sum())
+
+    ytd = float(combined.loc[combined["date"] >= ytd_start, "amount"].sum())
+    ttm = float(combined.loc[combined["date"] >= ttm_start, "amount"].sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Dividends (Total)", f"${total_all:,.2f}")
+    k2.metric("Dividends (YTD)", f"${ytd:,.2f}")
+    k3.metric("Dividends (TTM)", f"${ttm:,.2f}")
+    k4.metric("Manual vs Est", f"${manual_total:,.2f} / ${est_total:,.2f}")
+
+    st.caption("If Yahoo-estimated is enabled: values are best-effort estimates using dividend-per-share history × shares held on that date.")
+
+    # Monthly series
+    monthly = combined.copy()
+    monthly["month"] = monthly["date"].dt.to_period("M").dt.to_timestamp()
+    monthly_sum = monthly.groupby(["month"], as_index=False).agg(amount=("amount", "sum")).sort_values("month")
+    st.markdown("### Monthly dividends")
+    if not monthly_sum.empty:
+        chart = monthly_sum.set_index("month")[["amount"]]
+        st.bar_chart(chart)
+
+    # By ticker table
+    st.markdown("### Dividends by ticker")
+    by_ticker = combined.groupby(["ticker"], as_index=False).agg(amount=("amount", "sum")).sort_values("amount", ascending=False)
+    st.dataframe(by_ticker, use_container_width=True)
+
+    # Full ledger table
+    st.markdown("### Dividend ledger")
+    view = combined.sort_values(["date", "ticker"]).copy()
+    view["date"] = view["date"].dt.date.astype(str)
+    view["amount"] = view["amount"].map(lambda x: f"{x:,.2f}")
+    st.dataframe(view, use_container_width=True)
 
 
 # =========================
-# 5) UI formatting helpers (BIG “pro” touch)
-# =========================
-def fmt_money(x):
-    if pd.isna(x):
-        return ""
-    return f"${x:,.2f}"
-
-
-def fmt_price(x):
-    if pd.isna(x):
-        return ""
-    return f"${x:,.2f}"
-
-
-def fmt_shares(x):
-    if pd.isna(x):
-        return ""
-    return f"{x:,.3f}"
-
-
-def fmt_pct(x):
-    if pd.isna(x):
-        return ""
-    return f"{x:,.2f}%"
-
-
-def styled_df(df: pd.DataFrame, money_cols=None, pct_cols=None, price_cols=None, shares_cols=None, hide_index=True):
-    money_cols = money_cols or []
-    pct_cols = pct_cols or []
-    price_cols = price_cols or []
-    shares_cols = shares_cols or []
-    sty = df.style
-    for c in money_cols:
-        if c in df.columns:
-            sty = sty.format({c: fmt_money})
-    for c in price_cols:
-        if c in df.columns:
-            sty = sty.format({c: fmt_price})
-    for c in shares_cols:
-        if c in df.columns:
-            sty = sty.format({c: fmt_shares})
-    for c in pct_cols:
-        if c in df.columns:
-            sty = sty.format({c: fmt_pct})
-    if hide_index:
-        sty = sty.hide(axis="index")
-    return sty
-
-
-def rename_holdings_df(holdings: pd.DataFrame) -> pd.DataFrame:
-    if holdings is None or holdings.empty:
-        return holdings
-    out = holdings.copy()
-    out = out.rename(
-        columns={
-            "ticker": "Ticker",
-            "shares": "Shares",
-            "avg_cost": "Avg Cost ($)",
-            "market_value": "Market Value ($)",
-            "unrealized_pnl": "Unrealized P&L ($)",
-        }
-    )
-    # keep cost_dollars internal; not shown here
-    return out
-
-
-def rename_lots_df(lots: pd.DataFrame) -> pd.DataFrame:
-    if lots is None or lots.empty:
-        return lots
-    out = lots.copy()
-    out = out.rename(
-        columns={
-            "lot_id": "Lot ID",
-            "ticker": "Ticker",
-            "buy_date": "Buy Date",
-            "buy_price": "Buy Price ($)",
-            "shares_open": "Open Shares",
-            "last_price": "Last Price ($)",
-            "market_value": "Market Value ($)",
-            "unrealized_pnl": "Unrealized P&L ($)",
-            "unrealized_return_%": "Unrealized Return (%)",
-        }
-    )
-    return out
-
-
-def rename_realized_df(rv: pd.DataFrame) -> pd.DataFrame:
-    if rv is None or rv.empty:
-        return rv
-    out = rv.copy()
-    out = out.rename(
-        columns={
-            "sale_id": "Sale ID",
-            "ticker": "Ticker",
-            "buy_date": "Buy Date",
-            "buy_price": "Buy Price ($)",
-            "sell_date": "Sell Date",
-            "sell_price": "Sell Price ($)",
-            "shares_sold": "Shares Sold",
-            "pnl": "Realized P&L ($)",
-            "realized_return_%": "Realized Return (%)",
-        }
-    )
-    return out
-
-
-def rename_sector_alloc_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    out["Weight (%)"] = out["weight"] * 100.0
-    out = out.rename(columns={"sector": "Sector", "market_value": "Market Value ($)"})
-    out = out.drop(columns=["weight"])
-    return out
-
-
-def rename_industry_alloc_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    out["Weight (%)"] = out["weight"] * 100.0
-    out = out.rename(columns={"sector": "Sector", "industry": "Industry", "market_value": "Market Value ($)"})
-    out = out.drop(columns=["weight"])
-    return out
-
-
-def rename_contrib_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    out = out.rename(
-        columns={
-            "ticker": "Ticker",
-            "unrealized_pnl": "Unrealized P&L ($)",
-            "realized_pnl": "Realized P&L ($)",
-            "dividend_pnl": "Dividends ($)",
-            "total_contribution": "Total Contribution ($)",
-        }
-    )
-    return out
-
-
-def rename_txn_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    out["date"] = pd.to_datetime(out["date"]).dt.date.astype(str)
-    out = out.rename(
-        columns={
-            "txn_id": "Txn ID",
-            "portfolio": "Portfolio",
-            "date": "Date",
-            "type": "Type",
-            "ticker": "Ticker",
-            "shares": "Shares",
-            "price": "Price ($)",
-            "amount": "Amount ($)",
-        }
-    )
-    return out
-
-
-# =========================
-# 6) Load data + reconcile
+# 5) Load data + reconcile
 # =========================
 portfolios_df = load_portfolios()
 txns_all = load_txns()
@@ -1175,7 +1068,7 @@ if not txns_all.empty:
 portfolio_names = portfolios_df["portfolio"].tolist()
 
 # =========================
-# 7) UI
+# 6) UI
 # =========================
 st.title("Brown Investment Group Portfolio")
 st.caption("Public view is read-only. Admin can edit portfolios, baseline lots, and transactions.")
@@ -1185,6 +1078,9 @@ match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
 
 freq_choice = st.sidebar.selectbox("Chart frequency", ["Weekly (Mon)", "Daily"], index=0)
 chart_freq = "W-MON" if freq_choice.startswith("Weekly") else "D"
+
+st.sidebar.markdown("---")
+include_estimated_divs = st.sidebar.toggle("Include Yahoo-estimated dividends (best effort)", value=False)
 
 # ---------- Public view ----------
 st.subheader("Public View (read-only)")
@@ -1208,181 +1104,107 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
 
     # KPIs
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Starting Cash", fmt_money(snap["starting_cash"]))
-    c2.metric("Cash", fmt_money(snap["cash"]))
-    c3.metric("Market Value", fmt_money(snap["market_value"]))
-    c4.metric("NAV", fmt_money(snap["nav"]))
+    c1.metric("Starting Cash", f"${snap['starting_cash']:,.2f}")
+    c2.metric("Cash", f"${snap['cash']:,.2f}")
+    c3.metric("Market Value", f"${snap['market_value']:,.2f}")
+    c4.metric("NAV", f"${snap['nav']:,.2f}")
 
     d1, d2 = st.columns(2)
-    d1.metric("Unrealized P&L", fmt_money(snap["unrealized_pnl"]))
-    d2.metric("Realized P&L", fmt_money(snap["realized_pnl"]))
+    d1.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
+    d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
 
-    # Tier-1 charts
     st.divider()
-    st.markdown("## Tier 1 Analytics")
+    tab1, tab2, tab3 = st.tabs(["Tier 1 Analytics", "Dividends", "Holdings & Ledger"])
 
-    # Sector allocation pie + sector->industry breakdown
-    sector_alloc, industry_alloc = build_allocation_tables(snap)
-    a1, a2 = st.columns([1, 1])
-    with a1:
-        st.markdown("### Sector allocation (incl. cash)")
-        render_sector_pie(sector_alloc, f"{pname} — Sector Allocation")
-        s_tbl = rename_sector_alloc_df(sector_alloc)
-        if s_tbl is not None and not s_tbl.empty:
+    with tab1:
+        st.markdown("## Tier 1 Analytics")
+
+        sector_alloc, industry_alloc = build_allocation_tables(snap)
+        a1, a2 = st.columns([1, 1])
+        with a1:
+            st.markdown("### Sector allocation (incl. cash)")
+            render_sector_pie(sector_alloc, f"{pname} — Sector Allocation")
             st.dataframe(
-                styled_df(
-                    s_tbl,
-                    money_cols=["Market Value ($)"],
-                    pct_cols=["Weight (%)"],
-                    hide_index=True,
-                ),
+                sector_alloc.assign(weight_pct=(sector_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
                 use_container_width=True,
             )
-        else:
-            st.info("No sector allocation available yet.")
-    with a2:
-        st.markdown("### Sector → Industry breakdown (Yahoo Finance)")
-        i_tbl = rename_industry_alloc_df(industry_alloc)
-        if i_tbl is not None and not i_tbl.empty:
+        with a2:
+            st.markdown("### Sector → Industry breakdown (Yahoo Finance)")
             st.dataframe(
-                styled_df(
-                    i_tbl,
-                    money_cols=["Market Value ($)"],
-                    pct_cols=["Weight (%)"],
-                    hide_index=True,
-                ),
+                industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
                 use_container_width=True,
             )
+
+        st.markdown("### Contribution to return (P&L contribution by ticker)")
+        contrib = build_contribution_table(snap)
+        if contrib.empty:
+            st.info("No contribution data yet (need holdings and/or sells/dividends).")
         else:
-            st.info("No industry breakdown available yet.")
+            st.dataframe(contrib, use_container_width=True)
+            st.bar_chart(contrib.set_index("ticker")[["total_contribution"]])
 
-    # Contribution to return
-    st.markdown("### Contribution to return (P&L contribution by ticker)")
-    contrib = build_contribution_table(snap)
-    if contrib.empty:
-        st.info("No contribution data yet (need holdings and/or sells/dividends).")
-    else:
-        contrib_tbl = rename_contrib_df(contrib)
-        st.dataframe(
-            styled_df(
-                contrib_tbl,
-                money_cols=["Unrealized P&L ($)", "Realized P&L ($)", "Dividends ($)", "Total Contribution ($)"],
-                hide_index=True,
-            ),
-            use_container_width=True,
-        )
-        chart_df = contrib_tbl.set_index("Ticker")[["Total Contribution ($)"]]
-        st.bar_chart(chart_df)
+        st.markdown("### Drawdown")
+        if nav_series is None or nav_series.dropna().empty:
+            st.info("No NAV series yet for drawdown.")
+        else:
+            dd = compute_drawdown(nav_series)
+            st.line_chart(dd)
 
-    # Dividend tracker (estimated)
-    st.markdown("### Dividend tracker (estimated from Yahoo)")
-    est_end = pd.to_datetime(date.today()).normalize()
-    est_start = est_end - pd.Timedelta(days=365)
+        st.markdown("### Beta / Alpha vs SPY")
+        if nav_series is None or spy_px is None or nav_series.dropna().empty or spy_px.dropna().empty:
+            st.info("Beta/alpha need both portfolio NAV series and benchmark series.")
+        else:
+            stats = compute_beta_alpha(nav_series, spy_px)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Beta", f"{stats['beta']:.2f}" if np.isfinite(stats["beta"]) else "—")
+            k2.metric("Alpha (annualized)", f"{stats['alpha_ann']*100:.2f}%" if np.isfinite(stats["alpha_ann"]) else "—")
+            k3.metric("R²", f"{stats['r2']:.2f}" if np.isfinite(stats["r2"]) else "—")
+            k4.metric("Obs", f"{stats['n']}")
 
-    est = estimate_dividends_for_portfolio(pname, meta, txns_all, baseline_all, est_start, est_end)
-    if est is None or est.empty:
-        st.caption("No estimated dividends found in the last 12 months for current holdings history.")
-    else:
-        total_est = float(est["Estimated Dividends ($)"].sum())
-        st.metric("Estimated dividends (last 12 months)", fmt_money(total_est))
-        st.dataframe(
-            styled_df(est, money_cols=["Estimated Dividends ($)"], hide_index=True),
-            use_container_width=True,
-        )
+            roll = rolling_beta_alpha(nav_series, spy_px, window=26)
+            if not roll.empty:
+                r1, r2 = st.columns(2)
+                with r1:
+                    st.caption("Rolling beta (26 periods)")
+                    st.line_chart(roll[["beta"]])
+                with r2:
+                    st.caption("Rolling alpha (annualized, 26 periods)")
+                    st.line_chart(roll[["alpha_ann"]])
 
-    # Drawdown + Beta/Alpha (if nav_series and spy provided)
-    st.markdown("### Drawdown")
-    if nav_series is None or nav_series.dropna().empty:
-        st.info("No NAV series yet for drawdown.")
-    else:
-        dd = compute_drawdown(nav_series)
-        st.line_chart(dd)
-
-    st.markdown("### Beta / Alpha vs SPY")
-    if nav_series is None or spy_px is None or nav_series.dropna().empty or spy_px.dropna().empty:
-        st.info("Beta/alpha need both portfolio NAV series and benchmark series.")
-    else:
-        stats = compute_beta_alpha(nav_series, spy_px)
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Beta", f"{stats['beta']:.2f}" if np.isfinite(stats["beta"]) else "—")
-        k2.metric("Alpha (annualized)", f"{stats['alpha_ann']*100:.2f}%" if np.isfinite(stats["alpha_ann"]) else "—")
-        k3.metric("R²", f"{stats['r2']:.2f}" if np.isfinite(stats["r2"]) else "—")
-        k4.metric("Obs", f"{stats['n']}")
-
-        roll = rolling_beta_alpha(nav_series, spy_px, window=26)
-        if not roll.empty:
-            r1, r2 = st.columns(2)
-            with r1:
-                st.caption("Rolling beta (26 periods)")
-                st.line_chart(roll[["beta"]])
-            with r2:
-                st.caption("Rolling alpha (annualized, 26 periods)")
-                st.line_chart(roll[["alpha_ann"]])
-
-    # Existing tables
-    st.divider()
-    if snap["holdings"] is not None and not snap["holdings"].empty:
-        st.markdown("### Holdings")
-        h_tbl = rename_holdings_df(snap["holdings"])
-        st.dataframe(
-            styled_df(
-                h_tbl,
-                money_cols=["Avg Cost ($)", "Market Value ($)", "Unrealized P&L ($)"],
-                shares_cols=["Shares"],
-                hide_index=True,
-            ),
-            use_container_width=True,
+    with tab2:
+        render_dividend_tracker(
+            pname=pname,
+            meta=meta,
+            p_txns=p_txns,
+            txns_all=txns_all,
+            baseline_all=baseline_all,
+            include_estimated=include_estimated_divs,
         )
 
-    if snap["lots"] is not None and not snap["lots"].empty:
-        st.markdown("### Open lots (baseline + buys)")
-        l_tbl = rename_lots_df(snap["lots"].sort_values(["ticker", "buy_date"]))
-        st.dataframe(
-            styled_df(
-                l_tbl,
-                money_cols=["Market Value ($)", "Unrealized P&L ($)"],
-                price_cols=["Buy Price ($)", "Last Price ($)"],
-                shares_cols=["Open Shares"],
-                pct_cols=["Unrealized Return (%)"],
-                hide_index=True,
-            ),
-            use_container_width=True,
-        )
+    with tab3:
+        if not snap["holdings"].empty:
+            st.markdown("### Holdings")
+            st.dataframe(snap["holdings"], use_container_width=True)
 
-    if snap["realized"] is not None and not snap["realized"].empty:
-        rv = snap["realized"].copy()
-        rv["realized_return_%"] = np.where(
-            rv["buy_price"] > 0,
-            ((rv["sell_price"] / rv["buy_price"]) - 1.0) * 100.0,
-            np.nan,
-        )
-        st.markdown("### Realized matches (per lot)")
-        rv_tbl = rename_realized_df(rv.sort_values(["sell_date", "ticker"], ascending=False))
-        st.dataframe(
-            styled_df(
-                rv_tbl,
-                money_cols=["Buy Price ($)", "Sell Price ($)", "Realized P&L ($)"],
-                shares_cols=["Shares Sold"],
-                pct_cols=["Realized Return (%)"],
-                hide_index=True,
-            ),
-            use_container_width=True,
-        )
+        if not snap["lots"].empty:
+            st.markdown("### Open lots (baseline + buys)")
+            st.dataframe(snap["lots"].sort_values(["ticker", "buy_date"]), use_container_width=True)
 
-    st.markdown("### Transactions (filtered by boundary when snapshot)")
-    if snap["filtered_txns"] is None or snap["filtered_txns"].empty:
-        st.write("No transactions.")
-    else:
-        t_tbl = rename_txn_df(snap["filtered_txns"])
-        st.dataframe(
-            styled_df(
-                t_tbl,
-                money_cols=["Price ($)", "Amount ($)"],
-                shares_cols=["Shares"],
-                hide_index=True,
-            ),
-            use_container_width=True,
-        )
+        if not snap["realized"].empty:
+            rv = snap["realized"].copy()
+            rv["realized_return_%"] = np.where(
+                rv["buy_price"] > 0,
+                ((rv["sell_price"] / rv["buy_price"]) - 1.0) * 100.0,
+                np.nan,
+            )
+            st.markdown("### Realized matches (per lot)")
+            st.dataframe(rv.sort_values(["sell_date", "ticker"], ascending=False), use_container_width=True)
+
+        st.markdown("### Transactions (filtered by boundary when snapshot)")
+        if snap["filtered_txns"].empty:
+            st.write("No transactions.")
+        else:
+            st.dataframe(snap["filtered_txns"], use_container_width=True)
 
 
 # ----------------------------
@@ -1420,16 +1242,16 @@ with public_tabs[0]:
         agg_nav_last = 0.0
         agg_nav = pd.Series(dtype=float)
     else:
-        agg_nav = nav_df.ffill().sum(axis=1)
+        agg_nav = nav_df.fillna(method="ffill").sum(axis=1)
         agg_nav_last = float(agg_nav.iloc[-1])
 
     total_cash = float(np.nansum(list(cash_now_by_port.values()))) if cash_now_by_port else 0.0
     total_pnl = float(np.nansum(list(pnl_now_by_port.values()))) if pnl_now_by_port else 0.0
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("ALL Total Cash", fmt_money(total_cash))
-    c2.metric("ALL Total Gains (P&L)", fmt_money(total_pnl))
-    c3.metric("ALL NAV (Cash + MV)", fmt_money(agg_nav_last))
+    c1.metric("ALL Total Cash", f"${total_cash:,.2f}")
+    c2.metric("ALL Total Gains (P&L)", f"${total_pnl:,.2f}")
+    c3.metric("ALL NAV (Cash + MV)", f"${agg_nav_last:,.2f}")
 
     st.divider()
 
@@ -1471,6 +1293,7 @@ with public_tabs[0]:
             st.line_chart(dd_agg)
 
     st.divider()
+
 
 # ----------------------------
 # Individual portfolio tabs
@@ -1566,66 +1389,86 @@ if is_admin:
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
+    # =========================
+    # Tabs
+    # =========================
     admin_tabs = st.tabs(["Transactions", "Portfolio Settings", "Baseline lots", "Documentation"])
 
     # -----------------------
     # Transactions tab
     # -----------------------
+    def _set_price_manual():
+        st.session_state["txn_price_source"] = "manual"
+
+    def _apply_recommended_price():
+        tkr = _clean_str(st.session_state.get("txn_ticker", "")).upper()
+        d = st.session_state.get("txn_date", date.today())
+        rec = fetch_recommended_close(tkr, d)
+        if rec is not None:
+            st.session_state["txn_price"] = float(rec)
+            st.session_state["txn_price_source"] = "auto"
+
     with admin_tabs[0]:
         st.subheader("Transactions")
 
-        # --- Add txn (with recommended close price prefill, editable) ---
+        # Initialize state
+        st.session_state.setdefault("txn_price_source", "auto")
+
         with st.form("add_txn_form", clear_on_submit=True):
-            txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0)
-            t_date = st.date_input("Date", value=date.today())
+            txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0, key="txn_type")
+            t_date = st.date_input("Date", value=date.today(), key="txn_date")
+
+            # One ticker input shared across trade + dividend (no duplication)
+            t_ticker = st.text_input("Ticker", value="AAPL" if txn_type != "dividend" else "", key="txn_ticker")
 
             if txn_type in ["buy", "sell"]:
-                c1, c2, c3 = st.columns([1, 1, 1])
-                with c1:
-                    t_ticker = st.text_input("Ticker", value="AAPL", key="txn_ticker_trade")
-                with c2:
-                    t_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
-                with c3:
-                    # Recommended close price
-                    use_reco = st.checkbox("Use recommended close price", value=True)
+                # Shares
+                t_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f", key="txn_shares")
 
-                    reco = fetch_close_on_or_before(_clean_str(t_ticker).upper(), pd.to_datetime(t_date))
-                    price_key = "txn_price_trade"
+                # Recommended price UX
+                cA, cB = st.columns([1, 2])
+                with cA:
+                    use_rec = st.checkbox("Use recommended close", value=True, key="use_rec_price")
+                with cB:
+                    st.caption("Recommended = close on transaction date (or prior trading day). You can override.")
 
-                    # Only prefill if using reco AND we have a reco AND user hasn't manually overridden
-                    last_key = "txn_price_last_signature"
-                    signature = (str(_clean_str(t_ticker).upper()), str(pd.to_datetime(t_date).date()))
+                # If using recommended, refresh price each rerun
+                rec = fetch_recommended_close(_clean_str(t_ticker).upper(), t_date) if use_rec else None
+                if use_rec and rec is not None:
+                    # only overwrite if previous value came from auto (prevents stomping manual edits)
+                    if st.session_state.get("txn_price_source", "auto") == "auto":
+                        st.session_state["txn_price"] = float(rec)
 
-                    if use_reco and np.isfinite(reco):
-                        if (last_key not in st.session_state) or (st.session_state.get(last_key) != signature):
-                            st.session_state[price_key] = float(reco)
-                            st.session_state[last_key] = signature
-
-                    t_price = st.number_input(
-                        "Price ($)",
-                        min_value=0.0,
-                        value=float(st.session_state.get(price_key, 0.0)) if use_reco and np.isfinite(reco) else 100.00,
-                        step=0.01,
-                        format="%.2f",
-                        key=price_key,
-                    )
-
-                    if use_reco and np.isfinite(reco):
-                        st.caption(f"Suggested: {fmt_price(reco)} (closest close on/before date)")
+                # Price input (editable). If user edits it, we mark manual.
+                t_price = st.number_input(
+                    "Price",
+                    min_value=0.0,
+                    value=float(st.session_state.get("txn_price", rec if rec is not None else 0.0) or 0.0),
+                    step=0.01,
+                    format="%.2f",
+                    key="txn_price",
+                    on_change=_set_price_manual,
+                )
 
                 t_amount = np.nan
+
+                if st.form_submit_button("Save transaction", use_container_width=True):
+                    # on submit: if user had use_rec enabled, treat as auto (unless they edited)
+                    if use_rec:
+                        # If they never edited and rec exists, lock to rec
+                        if rec is not None and st.session_state.get("txn_price_source") == "auto":
+                            t_price = float(rec)
+                    add_txn = True
+                else:
+                    add_txn = False
+
             else:
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    t_ticker = st.text_input("Ticker (optional)", value="", key="txn_ticker_div")
-                with c2:
-                    t_amount = st.number_input(
-                        "Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f"
-                    )
+                t_amount = st.number_input(
+                    "Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f", key="txn_amount"
+                )
                 t_shares = np.nan
                 t_price = np.nan
-
-            add_txn = st.form_submit_button("Save transaction")
+                add_txn = st.form_submit_button("Save transaction", use_container_width=True)
 
         if add_txn:
             row = {
@@ -1650,6 +1493,8 @@ if is_admin:
                 txns_all = candidate_txns
                 save_txns(txns_all)
                 st.success("Saved.")
+                # reset price source for next entry
+                st.session_state["txn_price_source"] = "auto"
                 st.rerun()
 
         st.divider()
@@ -1698,20 +1543,6 @@ if is_admin:
                     st.warning("Deleted.")
                     st.rerun()
 
-        st.divider()
-        st.subheader("Transactions table (formatted)")
-        t_tbl = rename_txn_df(p_txns.sort_values("date", ascending=False))
-        if t_tbl is not None and not t_tbl.empty:
-            st.dataframe(
-                styled_df(
-                    t_tbl,
-                    money_cols=["Price ($)", "Amount ($)"],
-                    shares_cols=["Shares"],
-                    hide_index=True,
-                ),
-                use_container_width=True,
-            )
-
     # -----------------------
     # Portfolio Settings tab
     # -----------------------
@@ -1755,7 +1586,7 @@ if is_admin:
                     bl_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
                 with c3:
                     bl_price = st.number_input(
-                        "Cost basis (price) ($)", min_value=0.0, value=100.00, step=0.01, format="%.2f"
+                        "Cost basis (price)", min_value=0.0, value=100.00, step=0.01, format="%.2f"
                     )
                 with c4:
                     bl_date = st.date_input("Acquisition date", value=date.today())
@@ -1783,28 +1614,7 @@ if is_admin:
             if p_base.empty:
                 st.info("No baseline lots yet.")
             else:
-                # formatted display
-                base_tbl = p_base.copy()
-                base_tbl["buy_date"] = pd.to_datetime(base_tbl["buy_date"]).dt.date.astype(str)
-                base_tbl = base_tbl.rename(
-                    columns={
-                        "lot_id": "Lot ID",
-                        "portfolio": "Portfolio",
-                        "ticker": "Ticker",
-                        "buy_date": "Buy Date",
-                        "buy_price": "Buy Price ($)",
-                        "shares_open": "Open Shares",
-                    }
-                )
-                st.dataframe(
-                    styled_df(
-                        base_tbl.sort_values(["Ticker", "Buy Date"]),
-                        price_cols=["Buy Price ($)"],
-                        shares_cols=["Open Shares"],
-                        hide_index=True,
-                    ),
-                    use_container_width=True,
-                )
+                st.dataframe(p_base.sort_values(["ticker", "buy_date"]), use_container_width=True)
 
                 p_base_disp = p_base.copy()
                 p_base_disp["display"] = (
@@ -1854,15 +1664,17 @@ if is_admin:
 
 ---
 
-### Charting notes
-- Charts start at the portfolio **As-of date** (no line before the start date).
-- Weekly mode samples on **Mondays**, but always includes the start date.
+### Price recommendation notes
+- For **buy/sell**, the app can auto-fill **Price** with the **close on the transaction date**.
+- If the date is not a trading day, it uses the **most recent prior trading day**.
+- You can always override manually.
 
 ---
 
-### Recommended transaction price
-- For buys/sells, the app can **prefill** a suggested price using the **closest close on/before your transaction date**.
-- You can always override the suggested price before saving.
+### Dividend tracker notes
+- Manual dividends are whatever you enter as `dividend` transactions.
+- Optional: **Yahoo-estimated dividends** are best-effort estimates using dividend-per-share history × shares held on that date.
+  - Treat as an estimate (data gaps, specials, ETFs can be messy).
 
 ---
 
