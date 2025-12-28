@@ -326,7 +326,11 @@ def recommend_close_on_or_before(ticker: str, d: pd.Timestamp) -> tuple[float | 
     else:
         s = px["Close"].copy()
 
-    s.index = pd.to_datetime(s.index).normalize()
+   idx = pd.to_datetime(s.index, errors="coerce")
+if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+    idx = idx.tz_convert(None)
+s.index = pd.DatetimeIndex(idx).normalize()
+
     s = s.dropna()
     s = s[s.index <= d]
     if s.empty:
@@ -351,14 +355,29 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400)
+def _to_naive_normalized_datetime_index(idx) -> pd.DatetimeIndex:
+    """
+    Convert any datetime-like index to tz-naive, normalized DatetimeIndex.
+    Handles tz-aware indexes returned by yfinance.
+    """
+    dt = pd.to_datetime(idx, errors="coerce")
+    # If tz-aware, drop timezone safely
+    if isinstance(dt, pd.DatetimeIndex) and dt.tz is not None:
+        dt = dt.tz_convert(None)
+    # Normalize to midnight
+    return pd.DatetimeIndex(dt).normalize()
+
+
+@st.cache_data(ttl=86400)
 def fetch_dividend_events(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
     """
     Returns dividend per share series for [start, end].
-    yfinance returns ex-date-ish index (event date in Yahoo's data).
+    yfinance may return tz-aware index; we convert to tz-naive before filtering.
     """
     t = str(ticker).upper().strip()
     if not t:
         return pd.Series(dtype=float)
+
     try:
         div = yf.Ticker(t).dividends
     except Exception:
@@ -367,10 +386,24 @@ def fetch_dividend_events(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -
     if div is None or len(div) == 0:
         return pd.Series(dtype=float)
 
-    div.index = pd.to_datetime(div.index).normalize()
+    # ---- critical fix: make index tz-naive + normalized ----
+    div = div.copy()
+    div.index = _to_naive_normalized_datetime_index(div.index)
     div = div.sort_index()
-    div = div[(div.index >= pd.to_datetime(start).normalize()) & (div.index <= pd.to_datetime(end).normalize())]
+
+    s = pd.to_datetime(start, errors="coerce")
+    e = pd.to_datetime(end, errors="coerce")
+    if pd.isna(s) or pd.isna(e):
+        return pd.Series(dtype=float)
+
+    s = s.tz_localize(None) if getattr(s, "tzinfo", None) is not None else s
+    e = e.tz_localize(None) if getattr(e, "tzinfo", None) is not None else e
+    s = s.normalize()
+    e = e.normalize()
+
+    div = div[(div.index >= s) & (div.index <= e)]
     return div.astype(float)
+
 
 
 # ============================================================
