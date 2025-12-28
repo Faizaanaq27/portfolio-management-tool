@@ -249,10 +249,6 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
 
 @st.cache_data(ttl=900)
 def fetch_recommended_close(ticker: str, d: date) -> float | None:
-    """
-    Returns the Yahoo Finance *adjusted* close (auto_adjust=True) on that date if available.
-    Falls back to last available close before that date (within a short window).
-    """
     t = str(ticker).upper().strip()
     if not t:
         return None
@@ -269,21 +265,51 @@ def fetch_recommended_close(ticker: str, d: date) -> float | None:
     if s.empty:
         return None
 
-    # exact date if present
     if dt in s.index:
         return float(s.loc[dt])
 
-    # otherwise, last available prior
     prior = s[s.index <= dt]
     if not prior.empty:
         return float(prior.iloc[-1])
 
-    # last resort: earliest after
     after = s[s.index > dt]
     if not after.empty:
         return float(after.iloc[0])
 
     return None
+
+
+# =========================
+# Dividends (Yahoo Finance)
+# =========================
+@st.cache_data(ttl=86400)
+def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    """
+    Returns a Series indexed by dividend payment/ex-div date (Yahoo uses dividend date series),
+    values are cash dividend per share.
+    """
+    t = str(ticker).upper().strip()
+    if not t:
+        return pd.Series(dtype=float)
+
+    # pull a bit wider so we don't miss boundary
+    s = pd.to_datetime(start).normalize() - pd.Timedelta(days=7)
+    e = pd.to_datetime(end).normalize() + pd.Timedelta(days=7)
+
+    try:
+        div = yf.Ticker(t).dividends
+    except Exception:
+        return pd.Series(dtype=float)
+
+    if div is None or len(div) == 0:
+        return pd.Series(dtype=float)
+
+    div.index = pd.to_datetime(div.index).normalize()
+    div = div.sort_index()
+
+    div = div[(div.index >= s) & (div.index <= e)].copy()
+    div.name = t
+    return div.astype(float)
 
 
 # =========================
@@ -561,19 +587,16 @@ def compute_nav_series_for_portfolio(
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
-    # Portfolio txns
     txns = txns_all[txns_all["portfolio"] == pname].copy()
     if not txns.empty:
         txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
         txns = txns.sort_values(["date", "txn_id"])
         txns = txns[txns["date"] >= start].copy()
 
-    # Portfolio baseline
     baseline = baseline_all[baseline_all["portfolio"] == pname].copy()
     if not baseline.empty:
         baseline["ticker"] = baseline["ticker"].astype(str).str.upper().str.strip()
 
-    # Weekly series includes start date even if not Monday
     if chart_freq == "D":
         idx = pd.date_range(start=start, end=end, freq="D")
     else:
@@ -583,7 +606,6 @@ def compute_nav_series_for_portfolio(
     if len(idx) == 0:
         idx = pd.DatetimeIndex([start])
 
-    # ---- Cash series ----
     starting_cash = float(meta["starting_cash"])
     if txns.empty:
         cash = pd.Series(starting_cash, index=idx)
@@ -599,7 +621,6 @@ def compute_nav_series_for_portfolio(
 
         cash = starting_cash + cash_flow.cumsum()
 
-    # ---- Shares series ----
     baseline_shares = {}
     if not baseline.empty:
         for _, r in baseline.iterrows():
@@ -622,7 +643,6 @@ def compute_nav_series_for_portfolio(
 
     shares_df = pd.DataFrame(0.0, index=idx, columns=tickers)
 
-    # Baseline injection at start index point
     for t, sh in baseline_shares.items():
         if t in shares_df.columns:
             shares_df.loc[idx[0], t] += sh
@@ -643,7 +663,6 @@ def compute_nav_series_for_portfolio(
 
     shares_df = shares_df.cumsum()
 
-    # ---- Prices & NAV ----
     px_daily = fetch_price_history(tickers, start, end)
     if px_daily.empty:
         nav = cash.copy()
@@ -658,6 +677,238 @@ def compute_nav_series_for_portfolio(
     nav = cash + mv
     nav.name = pname
     return nav
+
+
+# =========================
+# Dividend tracker (quarter-end accrual)
+# =========================
+def _quarter_end(ts: pd.Timestamp) -> pd.Timestamp:
+    # normalize to quarter end date (calendar quarter)
+    return (pd.Timestamp(ts).to_period("Q").end_time).normalize()
+
+
+def compute_shares_on_dates(
+    pname: str,
+    meta: dict,
+    txns_all: pd.DataFrame,
+    baseline_all: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """
+    Returns DataFrame index=dates, columns=tickers, values=shares held on each date.
+    Uses:
+      - baseline shares injected at portfolio start boundary
+      - buys/sells after boundary
+    """
+    start = _portfolio_start_date(meta)
+    dates = pd.to_datetime(dates).normalize()
+    if len(dates) == 0:
+        return pd.DataFrame()
+
+    # filter portfolio txns
+    txns = txns_all[txns_all["portfolio"] == pname].copy()
+    if not txns.empty:
+        txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
+        txns = txns.sort_values(["date", "txn_id"])
+        txns = txns[txns["date"] >= start].copy()
+
+    # baseline shares
+    baseline = baseline_all[baseline_all["portfolio"] == pname].copy()
+    baseline_shares: dict[str, float] = {}
+    if not baseline.empty:
+        baseline["ticker"] = baseline["ticker"].astype(str).str.upper().str.strip()
+        for _, r in baseline.iterrows():
+            t = str(r["ticker"]).upper().strip()
+            baseline_shares[t] = baseline_shares.get(t, 0.0) + float(r["shares_open"])
+
+    trades = txns[txns["type"].isin(["buy", "sell"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
+    tickers = set(baseline_shares.keys())
+
+    if not trades.empty:
+        trades["ticker"] = trades["ticker"].astype(str).str.upper().str.strip()
+        trades["signed_shares"] = np.where(trades["type"] == "buy", trades["shares"], -trades["shares"])
+        tickers.update([t for t in trades["ticker"].unique() if t])
+
+    tickers = sorted([t for t in tickers if t])
+    if not tickers:
+        return pd.DataFrame(index=dates)
+
+    # Build at daily resolution spanning needed range, then sample at `dates`
+    d0 = min(start, dates.min())
+    d1 = max(dates.max(), start)
+    daily = pd.date_range(d0, d1, freq="D")
+
+    shares_daily = pd.DataFrame(0.0, index=daily, columns=tickers)
+
+    # baseline injection at start date
+    if start in shares_daily.index:
+        for t, sh in baseline_shares.items():
+            if t in shares_daily.columns:
+                shares_daily.loc[start, t] += sh
+    else:
+        # if start not in daily for some reason, inject at first day
+        for t, sh in baseline_shares.items():
+            if t in shares_daily.columns:
+                shares_daily.iloc[0, shares_daily.columns.get_loc(t)] += sh
+
+    # apply trades
+    if not trades.empty:
+        for t in tickers:
+            t_tr = trades[trades["ticker"] == t]
+            if t_tr.empty:
+                continue
+            delta_by_day = t_tr.groupby("date")["signed_shares"].sum()
+            shares_daily[t] += delta_by_day.reindex(daily, fill_value=0.0)
+
+    shares_daily = shares_daily.cumsum()
+
+    # sample at requested dates (ffill from daily)
+    return shares_daily.reindex(dates).ffill()
+
+
+def compute_dividend_accrual_quarterly(
+    pname: str,
+    meta: dict,
+    txns_all: pd.DataFrame,
+    baseline_all: pd.DataFrame,
+    end_date: pd.Timestamp,
+) -> dict:
+    """
+    Computes dividends earned (based on shares held on each dividend date),
+    then accrues them to quarter-end.
+
+    Returns:
+      {
+        "by_event": DataFrame [div_date, ticker, div_per_share, shares, cash_div],
+        "by_quarter_ticker": DataFrame [quarter_end, ticker, cash_div],
+        "by_quarter_total": DataFrame [quarter_end, cash_div],
+        "totals_by_ticker": DataFrame [ticker, cash_div],
+        "total": float
+      }
+    """
+    start = _portfolio_start_date(meta)
+    end = pd.to_datetime(end_date).normalize()
+
+    # determine universe of tickers ever held (baseline + trades)
+    p_txns = txns_all[txns_all["portfolio"] == pname].copy()
+    p_base = baseline_all[baseline_all["portfolio"] == pname].copy()
+
+    tickers = set()
+    if not p_base.empty:
+        tickers.update(p_base["ticker"].astype(str).str.upper().str.strip().tolist())
+
+    if not p_txns.empty:
+        tr = p_txns[p_txns["type"].isin(["buy", "sell"])].copy()
+        if not tr.empty:
+            tickers.update(tr["ticker"].astype(str).str.upper().str.strip().tolist())
+
+    tickers = sorted([t for t in tickers if t])
+    if not tickers:
+        empty = pd.DataFrame()
+        return {
+            "by_event": empty,
+            "by_quarter_ticker": empty,
+            "by_quarter_total": empty,
+            "totals_by_ticker": empty,
+            "total": 0.0,
+        }
+
+    # pull dividend events per ticker
+    events = []
+    for t in tickers:
+        div = fetch_dividends_series(t, start, end)
+        if div is None or div.empty:
+            continue
+        for d, v in div.items():
+            if pd.isna(v) or float(v) == 0:
+                continue
+            # only consider events within [start, end]
+            d = pd.to_datetime(d).normalize()
+            if d < start or d > end:
+                continue
+            events.append({"div_date": d, "ticker": t, "div_per_share": float(v)})
+
+    if not events:
+        empty = pd.DataFrame()
+        return {
+            "by_event": empty,
+            "by_quarter_ticker": empty,
+            "by_quarter_total": empty,
+            "totals_by_ticker": empty,
+            "total": 0.0,
+        }
+
+    ev = pd.DataFrame(events).sort_values(["div_date", "ticker"]).reset_index(drop=True)
+
+    # shares held on each dividend date
+    div_dates = pd.DatetimeIndex(sorted(ev["div_date"].unique()))
+    shares_on = compute_shares_on_dates(pname, meta, txns_all, baseline_all, div_dates)
+    if shares_on.empty:
+        empty = pd.DataFrame()
+        return {
+            "by_event": empty,
+            "by_quarter_ticker": empty,
+            "by_quarter_total": empty,
+            "totals_by_ticker": empty,
+            "total": 0.0,
+        }
+
+    # map shares for each event row
+    def _get_shares(row):
+        d = row["div_date"]
+        t = row["ticker"]
+        if d not in shares_on.index or t not in shares_on.columns:
+            return 0.0
+        return float(shares_on.loc[d, t])
+
+    ev["shares"] = ev.apply(_get_shares, axis=1)
+    ev = ev[ev["shares"] > 1e-12].copy()
+
+    if ev.empty:
+        empty = pd.DataFrame()
+        return {
+            "by_event": empty,
+            "by_quarter_ticker": empty,
+            "by_quarter_total": empty,
+            "totals_by_ticker": empty,
+            "total": 0.0,
+        }
+
+    ev["cash_div"] = ev["shares"] * ev["div_per_share"]
+
+    # accrue to quarter end
+    ev["quarter_end"] = ev["div_date"].apply(_quarter_end)
+
+    by_q_t = (
+        ev.groupby(["quarter_end", "ticker"], as_index=False)
+        .agg(cash_div=("cash_div", "sum"))
+        .sort_values(["quarter_end", "cash_div"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+
+    by_q = (
+        ev.groupby(["quarter_end"], as_index=False)
+        .agg(cash_div=("cash_div", "sum"))
+        .sort_values("quarter_end")
+        .reset_index(drop=True)
+    )
+
+    totals = (
+        ev.groupby("ticker", as_index=False)
+        .agg(cash_div=("cash_div", "sum"))
+        .sort_values("cash_div", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    total = float(ev["cash_div"].sum())
+
+    return {
+        "by_event": ev.sort_values(["div_date", "ticker"]).reset_index(drop=True),
+        "by_quarter_ticker": by_q_t,
+        "by_quarter_total": by_q,
+        "totals_by_ticker": totals,
+        "total": total,
+    }
 
 
 # =========================
@@ -875,9 +1126,11 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     d1.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
     d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
 
+    # Tier-1 charts
     st.divider()
     st.markdown("## Tier 1 Analytics")
 
+    # Sector allocation
     sector_alloc, industry_alloc = build_allocation_tables(snap)
     a1, a2 = st.columns([1, 1])
     with a1:
@@ -894,15 +1147,61 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
             use_container_width=True,
         )
 
+    # Contribution to return (existing)
     st.markdown("### Contribution to return (P&L contribution by ticker)")
     contrib = build_contribution_table(snap)
     if contrib.empty:
         st.info("No contribution data yet (need holdings and/or sells/dividends).")
     else:
         st.dataframe(contrib, use_container_width=True)
-        chart_df = contrib.set_index("ticker")[["total_contribution"]]
-        st.bar_chart(chart_df)
+        st.bar_chart(contrib.set_index("ticker")[["total_contribution"]])
 
+    # ✅ Dividend Tracker (Quarterly accrual)
+    st.markdown("### Dividend tracker (accrued to quarter-end)")
+    divpack = compute_dividend_accrual_quarterly(
+        pname=pname,
+        meta=meta,
+        txns_all=txns_all,
+        baseline_all=baseline_all,
+        end_date=pd.to_datetime(date.today()),
+    )
+
+    if divpack["total"] <= 0 or divpack["by_quarter_total"].empty:
+        st.info("No dividend accruals detected yet (either no dividend payers or no holding overlap).")
+    else:
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total dividends (since start)", f"${divpack['total']:,.2f}")
+
+        # trailing 4 quarters
+        byq = divpack["by_quarter_total"].copy()
+        byq = byq.sort_values("quarter_end")
+        last4 = byq.tail(4)["cash_div"].sum() if len(byq) >= 1 else 0.0
+        k2.metric("Trailing 4 quarters", f"${float(last4):,.2f}")
+
+        # best payer
+        top = divpack["totals_by_ticker"].iloc[0] if not divpack["totals_by_ticker"].empty else None
+        k3.metric("Top payer", f"{top['ticker']} (${top['cash_div']:,.2f})" if top is not None else "—")
+
+        # Charts
+        st.caption("Quarterly dividends are summed from actual dividend events, then posted at quarter-end.")
+        q_series = byq.set_index("quarter_end")["cash_div"]
+        st.line_chart(q_series)
+
+        if not divpack["totals_by_ticker"].empty:
+            st.caption("Total dividends by ticker")
+            st.bar_chart(divpack["totals_by_ticker"].set_index("ticker")[["cash_div"]])
+
+        # Tables
+        with st.expander("Show dividend schedule (by quarter)"):
+            st.dataframe(byq, use_container_width=True)
+
+        with st.expander("Show dividend detail (by quarter & ticker)"):
+            st.dataframe(divpack["by_quarter_ticker"], use_container_width=True)
+
+        with st.expander("Show raw dividend events (date-level)"):
+            st.dataframe(divpack["by_event"], use_container_width=True)
+
+    # Drawdown + Beta/Alpha
     st.markdown("### Drawdown")
     if nav_series is None or nav_series.dropna().empty:
         st.info("No NAV series yet for drawdown.")
@@ -931,6 +1230,7 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
                 st.caption("Rolling alpha (annualized, 26 periods)")
                 st.line_chart(roll[["alpha_ann"]])
 
+    # Existing tables
     st.divider()
     if not snap["holdings"].empty:
         st.markdown("### Holdings")
@@ -967,6 +1267,7 @@ with public_tabs[0]:
     nav_series_map = {}
     cash_now_by_port = {}
     pnl_now_by_port = {}
+    div_total_by_port = {}
 
     for p in portfolio_names:
         meta = get_portfolio_meta(portfolios_df, p)
@@ -986,6 +1287,9 @@ with public_tabs[0]:
             chart_freq=chart_freq,
         )
 
+        divpack = compute_dividend_accrual_quarterly(p, meta, txns_all, baseline_all, end_date=end_date)
+        div_total_by_port[p] = float(divpack["total"]) if divpack else 0.0
+
     nav_df = pd.DataFrame(nav_series_map).sort_index()
 
     if nav_df.empty:
@@ -997,11 +1301,13 @@ with public_tabs[0]:
 
     total_cash = float(np.nansum(list(cash_now_by_port.values()))) if cash_now_by_port else 0.0
     total_pnl = float(np.nansum(list(pnl_now_by_port.values()))) if pnl_now_by_port else 0.0
+    total_divs = float(np.nansum(list(div_total_by_port.values()))) if div_total_by_port else 0.0
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("ALL Total Cash", f"${total_cash:,.2f}")
     c2.metric("ALL Total Gains (P&L)", f"${total_pnl:,.2f}")
     c3.metric("ALL NAV (Cash + MV)", f"${agg_nav_last:,.2f}")
+    c4.metric("ALL Dividends (accrued)", f"${total_divs:,.2f}")
 
     st.divider()
 
@@ -1041,6 +1347,15 @@ with public_tabs[0]:
         dd_agg = compute_drawdown(agg_nav)
         if not dd_agg.empty:
             st.line_chart(dd_agg)
+
+    # Optional: overview dividend ranking
+    st.markdown("### Dividends (by portfolio, accrued to quarter-end)")
+    if div_total_by_port:
+        df_div = pd.DataFrame(
+            [{"portfolio": k, "dividends": float(v)} for k, v in div_total_by_port.items()]
+        ).sort_values("dividends", ascending=False)
+        st.dataframe(df_div, use_container_width=True)
+        st.bar_chart(df_div.set_index("portfolio")[["dividends"]])
 
     st.divider()
 
@@ -1154,7 +1469,6 @@ if is_admin:
         # =========================================================
         st.markdown("### Add transaction")
 
-        # init session defaults once
         st.session_state.setdefault("txn_type", "buy")
         st.session_state.setdefault("txn_date", date.today())
         st.session_state.setdefault("txn_ticker", "AAPL")
@@ -1193,11 +1507,9 @@ if is_admin:
                 key="txn_use_recommended",
             )
 
-            # seed price if missing
             if "txn_price" not in st.session_state:
                 st.session_state["txn_price"] = float(rec) if rec is not None else 100.00
 
-            # If checkbox is ON and user hasn't overridden, keep synced
             if use_rec and (not st.session_state["txn_price_overridden"]) and rec is not None:
                 st.session_state["txn_price"] = float(rec)
 
@@ -1212,11 +1524,9 @@ if is_admin:
                     key="txn_price",
                 )
 
-            # manual override detection (no callbacks)
             if float(t_price) != float(prev):
                 st.session_state["txn_price_overridden"] = True
 
-            # nice touch: if user toggles OFF -> ON, resync & clear override
             if (not bool(st.session_state["txn_use_recommended_prev"])) and bool(use_rec):
                 st.session_state["txn_price_overridden"] = False
                 if rec is not None:
@@ -1271,10 +1581,7 @@ if is_admin:
             else:
                 txns_all = candidate_txns
                 save_txns(txns_all)
-
-                # nice touch: reset override for next entry
                 st.session_state["txn_price_overridden"] = False
-
                 st.success("Saved.")
                 st.rerun()
 
@@ -1448,6 +1755,13 @@ if is_admin:
 ### Charting notes
 - Charts start at the portfolio **As-of date** (no line before the start date).
 - Weekly mode samples on **Mondays**, but always includes the start date.
+
+---
+
+### Dividend tracker notes
+- Dividends are sourced from Yahoo Finance (cash dividends per share).
+- We compute dividends on each dividend event date based on the shares you held that day.
+- We then **accrue** those dividends to the **quarter-end** for reporting.
 
 ---
 
