@@ -1,3 +1,4 @@
+# app.py
 import hmac
 from datetime import date
 from pathlib import Path
@@ -59,7 +60,16 @@ BASELINE_PATH = "baseline_lots.csv"
 TXN_COLS = ["txn_id", "portfolio", "date", "type", "ticker", "shares", "price", "amount"]
 PORTFOLIO_COLS = ["portfolio", "start_mode", "as_of_date", "starting_cash"]
 VALID_MODES = ["ledger_complete", "snapshot_start"]
+# NOTE: shares_open can be POSITIVE (long) or NEGATIVE (short) for snapshot portfolios
 BASELINE_COLS = ["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shares_open"]
+
+# Transaction types:
+# - buy: open/increase long
+# - sell: reduce/close long
+# - short: open/increase short (borrow+sell)
+# - cover: buy-to-cover reduce/close short
+# - dividend: cash dividend
+VALID_TXN_TYPES = ["buy", "sell", "short", "cover", "dividend"]
 
 
 def _clean_str(x) -> str:
@@ -149,9 +159,9 @@ def load_txns() -> pd.DataFrame:
     df["txn_id"] = df["txn_id"].astype(str)
 
     df = df.dropna(subset=["portfolio", "date", "type", "txn_id"])
-    df = df[df["type"].isin(["buy", "sell", "dividend"])].copy()
+    df = df[df["type"].isin(VALID_TXN_TYPES)].copy()
 
-    is_trade = df["type"].isin(["buy", "sell"])
+    is_trade = df["type"].isin(["buy", "sell", "short", "cover"])
     trades = df[is_trade].dropna(subset=["ticker", "shares", "price"]).copy()
     trades = trades[(trades["shares"] > 0) & (trades["price"] >= 0)]
 
@@ -192,7 +202,8 @@ def load_baseline() -> pd.DataFrame:
     df["shares_open"] = pd.to_numeric(df["shares_open"], errors="coerce")
 
     df = df.dropna(subset=["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shares_open"])
-    df = df[(df["shares_open"] > 0) & (df["buy_price"] >= 0)]
+    # allow negative shares_open (short baseline), but not zero
+    df = df[(df["shares_open"].abs() > 1e-12) & (df["buy_price"] >= 0)]
     return df.sort_values(["portfolio", "ticker", "buy_date", "lot_id"]).reset_index(drop=True)
 
 
@@ -326,32 +337,76 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 
 
 # =========================
-# 3) Lot engine + accounting
+# 3) Lot engine + accounting (LONG + SHORT)
 # =========================
-def apply_sell_to_lots(lots: list[dict], sell_shares: float, method: str):
+def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, side: str):
+    """
+    Reduce existing exposure by matching lots.
+
+    side="LONG": reduce positive shares by consuming positive lots toward 0
+    side="SHORT": reduce short by consuming negative lots toward 0 (increase toward 0)
+    """
     realized_rows = []
-    remaining = sell_shares
-    lot_iter = lots if method.upper() == "FIFO" else list(reversed(lots))
+    remaining = float(reduce_shares)
+
+    if method.upper() == "FIFO":
+        lot_iter = lots
+    else:
+        lot_iter = list(reversed(lots))
 
     i = 0
     while remaining > 1e-12 and i < len(lot_iter):
         lot = lot_iter[i]
-        if lot["shares_open"] <= 1e-12:
-            i += 1
-            continue
-        take = min(remaining, lot["shares_open"])
-        lot["shares_open"] -= take
-        remaining -= take
-        realized_rows.append((lot, take))
-    return realized_rows
+        sh_open = float(lot["shares_open"])
+
+        if side == "LONG":
+            if sh_open <= 1e-12:
+                i += 1
+                continue
+            take = min(remaining, sh_open)
+            lot["shares_open"] = sh_open - take
+            remaining -= take
+            realized_rows.append((lot, take))
+
+        else:  # SHORT
+            if sh_open >= -1e-12:
+                i += 1
+                continue
+            avail = abs(sh_open)
+            take = min(remaining, avail)
+            # shares_open is negative; move toward 0 by adding take
+            lot["shares_open"] = sh_open + take
+            remaining -= take
+            realized_rows.append((lot, take))
+
+    return realized_rows, remaining
 
 
 def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, method: str):
+    """
+    Lots support:
+      - shares_open > 0 : long lots (entry = buy_price)
+      - shares_open < 0 : short lots (entry = short_price stored in buy_price)
+    Realized PnL:
+      - LONG: shares_sold * (sell_price - entry)
+      - SHORT: shares_covered * (entry - cover_price)
+    """
     open_cols = ["lot_id", "ticker", "buy_date", "buy_price", "shares_open"]
-    real_cols = ["sale_id", "ticker", "buy_date", "buy_price", "sell_date", "sell_price", "shares_sold", "pnl"]
+    real_cols = [
+        "sale_id",
+        "ticker",
+        "position",
+        "buy_date",
+        "buy_price",
+        "sell_date",
+        "sell_price",
+        "shares_sold",
+        "pnl",
+    ]
 
-    lots_by_ticker = {}
+    lots_by_ticker: dict[str, list[dict]] = {}
 
+    # baseline lots (can be long or short)
     if not baseline.empty:
         for _, r in baseline.iterrows():
             t = str(r["ticker"]).upper().strip()
@@ -361,7 +416,7 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
                     "ticker": t,
                     "buy_date": pd.to_datetime(r["buy_date"]).date(),
                     "buy_price": float(r["buy_price"]),
-                    "shares_open": float(r["shares_open"]),
+                    "shares_open": float(r["shares_open"]),  # signed
                 }
             )
 
@@ -370,52 +425,76 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
     if trades.empty:
         open_lots = []
         for _, lots in lots_by_ticker.items():
-            open_lots.extend([x for x in lots if x["shares_open"] > 1e-12])
+            open_lots.extend([x for x in lots if abs(float(x["shares_open"])) > 1e-12])
         return pd.DataFrame(open_lots, columns=open_cols), pd.DataFrame(columns=real_cols)
 
     trades = trades.copy().sort_values(["ticker", "date", "txn_id"])
     for _, r in trades.iterrows():
         typ = str(r["type"]).lower()
         tkr = str(r["ticker"]).upper().strip()
+        sh = float(r["shares"])
+        px = float(r["price"])
+        dt = pd.to_datetime(r["date"]).date()
+        tid = str(r["txn_id"])
+
+        lots_by_ticker.setdefault(tkr, [])
 
         if typ == "buy":
-            lots_by_ticker.setdefault(tkr, []).append(
-                {
-                    "lot_id": str(r["txn_id"]),
-                    "ticker": tkr,
-                    "buy_date": pd.to_datetime(r["date"]).date(),
-                    "buy_price": float(r["price"]),
-                    "shares_open": float(r["shares"]),
-                }
+            # open/increase long
+            lots_by_ticker[tkr].append(
+                {"lot_id": tid, "ticker": tkr, "buy_date": dt, "buy_price": px, "shares_open": +sh}
             )
 
         elif typ == "sell":
-            sell_shares = float(r["shares"])
-            sell_price = float(r["price"])
-            sell_date = pd.to_datetime(r["date"]).date()
-            sale_id = str(r["txn_id"])
-
-            lots = lots_by_ticker.get(tkr, [])
-            matches = apply_sell_to_lots(lots, sell_shares, method)
-
+            # reduce long only
+            matches, rem = apply_reduce_to_lots(lots_by_ticker[tkr], sh, method, side="LONG")
             for lot, shares_sold in matches:
-                pnl = shares_sold * (sell_price - float(lot["buy_price"]))
+                pnl = shares_sold * (px - float(lot["buy_price"]))
                 realized.append(
                     {
-                        "sale_id": sale_id,
+                        "sale_id": tid,
                         "ticker": tkr,
+                        "position": "LONG",
                         "buy_date": lot["buy_date"],
                         "buy_price": float(lot["buy_price"]),
-                        "sell_date": sell_date,
-                        "sell_price": sell_price,
+                        "sell_date": dt,
+                        "sell_price": px,
                         "shares_sold": shares_sold,
                         "pnl": pnl,
                     }
                 )
+            # if rem > 0, validation should have prevented it.
+
+        elif typ == "short":
+            # open/increase short: store entry price in buy_price, shares_open negative
+            lots_by_ticker[tkr].append(
+                {"lot_id": tid, "ticker": tkr, "buy_date": dt, "buy_price": px, "shares_open": -sh}
+            )
+
+        elif typ == "cover":
+            # reduce short only
+            matches, rem = apply_reduce_to_lots(lots_by_ticker[tkr], sh, method, side="SHORT")
+            for lot, shares_cov in matches:
+                entry = float(lot["buy_price"])
+                pnl = shares_cov * (entry - px)
+                realized.append(
+                    {
+                        "sale_id": tid,
+                        "ticker": tkr,
+                        "position": "SHORT",
+                        "buy_date": lot["buy_date"],   # short open date
+                        "buy_price": entry,            # short entry
+                        "sell_date": dt,               # cover date
+                        "sell_price": px,              # cover price
+                        "shares_sold": shares_cov,
+                        "pnl": pnl,
+                    }
+                )
+            # if rem > 0, validation should have prevented it.
 
     open_lots = []
     for _, lots in lots_by_ticker.items():
-        open_lots.extend([x for x in lots if x["shares_open"] > 1e-12])
+        open_lots.extend([x for x in lots if abs(float(x["shares_open"])) > 1e-12])
 
     return pd.DataFrame(open_lots, columns=open_cols), pd.DataFrame(realized, columns=real_cols)
 
@@ -426,6 +505,10 @@ def cash_delta(row: pd.Series) -> float:
         return -float(row["shares"]) * float(row["price"])
     if typ == "sell":
         return +float(row["shares"]) * float(row["price"])
+    if typ == "short":
+        return +float(row["shares"]) * float(row["price"])
+    if typ == "cover":
+        return -float(row["shares"]) * float(row["price"])
     if typ == "dividend":
         return +float(row["amount"])
     return 0.0
@@ -446,6 +529,14 @@ def validate_candidate_state(
     portfolio_baseline: pd.DataFrame,
     method: str,
 ) -> tuple[bool, str]:
+    """
+    Rules:
+    - Snapshot portfolios: no txns before as_of_date
+    - No negative CASH (still enforced: no margin loans)
+    - SELL can only reduce existing LONG shares
+    - COVER can only reduce existing SHORT shares
+    - SHORT can open/increase shorts (no cap here; cash constraint still applies)
+    """
     start_mode = portfolio_meta["start_mode"]
     as_of = pd.to_datetime(portfolio_meta["as_of_date"])
     starting_cash = float(portfolio_meta["starting_cash"])
@@ -459,31 +550,51 @@ def validate_candidate_state(
         if (txns["date"] < as_of).any():
             return False, f"Snapshot portfolios cannot have transactions before as-of date ({as_of.date()})."
 
+    # cash must never go negative
     cash = starting_cash
     for _, r in txns.iterrows():
         cash += cash_delta(r)
         if cash < -1e-9:
             return False, "Invalid: cash would go negative (margin not allowed)."
 
-    trades = txns[txns["type"].isin(["buy", "sell"])].copy()
+    trades = txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy()
     if trades.empty:
         return True, ""
 
-    inv = {}
+    # Track long and short separately
+    long_shares = {}
+    short_shares = {}  # positive number = shares short
+
+    # baseline can be long (+) or short (-)
     if not portfolio_baseline.empty:
         for _, r in portfolio_baseline.iterrows():
             t = str(r["ticker"]).upper().strip()
-            inv[t] = inv.get(t, 0.0) + float(r["shares_open"])
+            sh0 = float(r["shares_open"])
+            if sh0 > 0:
+                long_shares[t] = long_shares.get(t, 0.0) + sh0
+            elif sh0 < 0:
+                short_shares[t] = short_shares.get(t, 0.0) + abs(sh0)
 
     for _, r in trades.sort_values(["date", "txn_id"]).iterrows():
         t = str(r["ticker"]).upper().strip()
         sh = float(r["shares"])
-        if r["type"] == "buy":
-            inv[t] = inv.get(t, 0.0) + sh
-        else:
-            if inv.get(t, 0.0) + 1e-12 < sh:
-                return False, f"Invalid SELL: not enough shares of {t} to sell {sh:.3f}."
-            inv[t] -= sh
+        typ = str(r["type"]).lower()
+
+        if typ == "buy":
+            long_shares[t] = long_shares.get(t, 0.0) + sh
+
+        elif typ == "sell":
+            if long_shares.get(t, 0.0) + 1e-12 < sh:
+                return False, f"Invalid SELL: not enough LONG shares of {t} to sell {sh:.3f}."
+            long_shares[t] -= sh
+
+        elif typ == "short":
+            short_shares[t] = short_shares.get(t, 0.0) + sh
+
+        elif typ == "cover":
+            if short_shares.get(t, 0.0) + 1e-12 < sh:
+                return False, f"Invalid COVER: not enough SHORT shares of {t} to cover {sh:.3f}."
+            short_shares[t] -= sh
 
     return True, ""
 
@@ -502,7 +613,7 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 
     cash_now = starting_cash + (df.apply(cash_delta, axis=1).sum() if not df.empty else 0.0)
 
-    trades = df[df["type"].isin(["buy", "sell"])].copy() if not df.empty else pd.DataFrame(columns=TXN_COLS)
+    trades = df[df["type"].isin(["buy", "sell", "short", "cover"])].copy() if not df.empty else pd.DataFrame(columns=TXN_COLS)
     open_lots, realized = build_lots_with_baseline(trades, baseline, method)
 
     if not open_lots.empty:
@@ -511,23 +622,36 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 
         lots_view = open_lots.copy()
         lots_view["last_price"] = lots_view["ticker"].map(live).astype(float)
+
+        # signed MV (short positions negative MV)
         lots_view["market_value"] = lots_view["shares_open"] * lots_view["last_price"]
+
+        # unified unrealized pnl works with signed shares:
+        # long: +sh*(last-entry)
+        # short: -sh*(last-entry) = +abs(sh)*(entry-last)
         lots_view["unrealized_pnl"] = lots_view["shares_open"] * (lots_view["last_price"] - lots_view["buy_price"])
+
+        lots_view["position"] = np.where(lots_view["shares_open"] >= 0, "LONG", "SHORT")
         lots_view["unrealized_return_%"] = np.where(
             lots_view["buy_price"] > 0,
             ((lots_view["last_price"] / lots_view["buy_price"]) - 1.0) * 100.0,
             np.nan,
         )
+        # For shorts, the above % is not the usual short return; keep it as "price return" and rely on PnL.
 
         tmp = lots_view.copy()
-        tmp["cost_dollars"] = tmp["shares_open"] * tmp["buy_price"]
+        tmp["abs_shares"] = tmp["shares_open"].abs()
+        tmp["cost_dollars"] = tmp["abs_shares"] * tmp["buy_price"]
+
         holdings = tmp.groupby("ticker", as_index=False).agg(
             shares=("shares_open", "sum"),
+            abs_shares=("abs_shares", "sum"),
             cost_dollars=("cost_dollars", "sum"),
             market_value=("market_value", "sum"),
             unrealized_pnl=("unrealized_pnl", "sum"),
         )
-        holdings["avg_cost"] = np.where(holdings["shares"] > 0, holdings["cost_dollars"] / holdings["shares"], np.nan)
+        holdings["position"] = np.where(holdings["shares"] >= 0, "LONG", "SHORT")
+        holdings["avg_cost"] = np.where(holdings["abs_shares"] > 0, holdings["cost_dollars"] / holdings["abs_shares"], np.nan)
         holdings = holdings.sort_values("market_value", ascending=False)
     else:
         lots_view = open_lots
@@ -557,31 +681,8 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 # =========================
 # 4) Chart helpers (WEEKLY/Daily)
 # =========================
-def portfolio_chart_start_date(
-    pname: str,
-    meta: dict,
-    txns_all: pd.DataFrame,
-) -> pd.Timestamp:
-    """
-    Critical fix:
-    - snapshot_start: start at as_of boundary
-    - ledger_complete: start at earliest txn date (NOT as_of_date, which defaults to today)
-    """
-    start_mode = str(meta.get("start_mode", "ledger_complete")).lower()
-    as_of = pd.to_datetime(meta.get("as_of_date", pd.to_datetime(date.today()))).normalize()
-
-    if start_mode == "snapshot_start":
-        return as_of
-
-    # ledger_complete
-    tx = txns_all[txns_all["portfolio"] == pname].copy()
-    if tx.empty:
-        return as_of
-    tx["date"] = pd.to_datetime(tx["date"], errors="coerce").dt.normalize()
-    tx = tx.dropna(subset=["date"])
-    if tx.empty:
-        return as_of
-    return tx["date"].min().normalize()
+def _portfolio_start_date(meta: dict) -> pd.Timestamp:
+    return pd.to_datetime(meta["as_of_date"]).normalize()
 
 
 def index_to_100(series: pd.Series) -> pd.Series:
@@ -603,7 +704,7 @@ def compute_nav_series_for_portfolio(
     end_date: pd.Timestamp,
     chart_freq: str,  # "D" or "W-MON"
 ) -> pd.Series:
-    start = portfolio_chart_start_date(pname, meta, txns_all)
+    start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
     txns = txns_all[txns_all["portfolio"] == pname].copy()
@@ -640,18 +741,33 @@ def compute_nav_series_for_portfolio(
 
         cash = starting_cash + cash_flow.cumsum()
 
+    # baseline net shares can include shorts
     baseline_shares = {}
     if not baseline.empty:
         for _, r in baseline.iterrows():
             t = str(r["ticker"]).upper().strip()
             baseline_shares[t] = baseline_shares.get(t, 0.0) + float(r["shares_open"])
 
-    trades = txns[txns["type"].isin(["buy", "sell"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
+    trades = txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
     tickers = set(baseline_shares.keys())
 
     if not trades.empty:
         trades["ticker"] = trades["ticker"].astype(str).str.upper().str.strip()
-        trades["signed_shares"] = np.where(trades["type"] == "buy", trades["shares"], -trades["shares"])
+        trades["signed_shares"] = np.select(
+            [
+                trades["type"] == "buy",
+                trades["type"] == "sell",
+                trades["type"] == "short",
+                trades["type"] == "cover",
+            ],
+            [
+                +trades["shares"],
+                -trades["shares"],
+                -trades["shares"],
+                +trades["shares"],
+            ],
+            default=0.0,
+        )
         tickers.update([t for t in trades["ticker"].unique() if t])
 
     tickers = sorted([t for t in tickers if t])
@@ -758,21 +874,26 @@ def rolling_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series, window: int = 26)
 
 
 def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    For portfolios with shorts, signed MV can be negative, so allocations use ABS exposure.
+    """
     rows = []
 
     if not snap["holdings"].empty:
         for _, r in snap["holdings"].iterrows():
-            rows.append(
-                {"ticker": str(r["ticker"]).upper().strip(), "label": str(r["ticker"]).upper().strip(), "market_value": float(r["market_value"])}
-            )
+            t = str(r["ticker"]).upper().strip()
+            mv = float(r["market_value"])
+            rows.append({"ticker": t, "label": t, "market_value": mv, "exposure": abs(mv)})
 
-    rows.append({"ticker": "", "label": "CASH", "market_value": float(snap["cash"])})
+    cash = float(snap["cash"])
+    rows.append({"ticker": "", "label": "CASH", "market_value": cash, "exposure": abs(cash)})
 
     df = pd.DataFrame(rows)
     df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce").fillna(0.0)
+    df["exposure"] = pd.to_numeric(df["exposure"], errors="coerce").fillna(0.0)
 
-    total = float(df["market_value"].sum())
-    df["weight"] = 0.0 if total <= 0 else (df["market_value"] / total)
+    total_exp = float(df["exposure"].sum())
+    df["weight"] = 0.0 if total_exp <= 0 else (df["exposure"] / total_exp)
 
     tickers = sorted([t for t in df["ticker"].unique().tolist() if t])
     meta = fetch_sector_industry(tickers) if tickers else pd.DataFrame(columns=["ticker", "sector", "industry"])
@@ -785,19 +906,19 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     sector_alloc = (
         df.groupby(["sector"], as_index=False)
-        .agg(market_value=("market_value", "sum"))
-        .sort_values("market_value", ascending=False)
+        .agg(exposure=("exposure", "sum"))
+        .sort_values("exposure", ascending=False)
     )
-    sector_total = float(sector_alloc["market_value"].sum())
-    sector_alloc["weight"] = np.where(sector_total > 0, sector_alloc["market_value"] / sector_total, 0.0)
+    sector_total = float(sector_alloc["exposure"].sum())
+    sector_alloc["weight"] = np.where(sector_total > 0, sector_alloc["exposure"] / sector_total, 0.0)
 
     industry_alloc = (
         df.groupby(["sector", "industry"], as_index=False)
-        .agg(market_value=("market_value", "sum"))
-        .sort_values(["sector", "market_value"], ascending=[True, False])
+        .agg(exposure=("exposure", "sum"))
+        .sort_values(["sector", "exposure"], ascending=[True, False])
     )
-    ind_total = float(industry_alloc["market_value"].sum())
-    industry_alloc["weight"] = np.where(ind_total > 0, industry_alloc["market_value"] / ind_total, 0.0)
+    ind_total = float(industry_alloc["exposure"].sum())
+    industry_alloc["weight"] = np.where(ind_total > 0, industry_alloc["exposure"] / ind_total, 0.0)
 
     return sector_alloc, industry_alloc
 
@@ -831,11 +952,11 @@ def build_contribution_table(snap: dict) -> pd.DataFrame:
 
 
 def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
-    if sector_alloc.empty or sector_alloc["market_value"].sum() <= 0:
+    if sector_alloc.empty or sector_alloc["exposure"].sum() <= 0:
         st.info("No sector allocation available yet.")
         return
     fig, ax = plt.subplots()
-    ax.pie(sector_alloc["market_value"], labels=sector_alloc["sector"], autopct="%1.1f%%", startangle=90)
+    ax.pie(sector_alloc["exposure"], labels=sector_alloc["sector"], autopct="%1.1f%%", startangle=90)
     ax.set_title(title)
     ax.axis("equal")
     st.pyplot(fig, clear_figure=True)
@@ -851,7 +972,11 @@ def compute_daily_shares_df(
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    start = portfolio_chart_start_date(pname, meta, txns_all)  # aligns dividend window with chart window
+    """
+    Daily NET shares outstanding by ticker from start boundary to end_date.
+    Shorts are negative shares; dividend accrual uses max(shares, 0) (i.e., ignores borrow costs).
+    """
+    start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
     idx = pd.date_range(start=start, end=end, freq="D")
     if len(idx) == 0:
@@ -871,11 +996,25 @@ def compute_daily_shares_df(
             t = str(r["ticker"]).upper().strip()
             baseline_shares[t] = baseline_shares.get(t, 0.0) + float(r["shares_open"])
 
-    trades = txns[txns["type"].isin(["buy", "sell"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
+    trades = txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
     tickers = set(baseline_shares.keys())
     if not trades.empty:
         trades["ticker"] = trades["ticker"].astype(str).str.upper().str.strip()
-        trades["signed_shares"] = np.where(trades["type"] == "buy", trades["shares"], -trades["shares"])
+        trades["signed_shares"] = np.select(
+            [
+                trades["type"] == "buy",
+                trades["type"] == "sell",
+                trades["type"] == "short",
+                trades["type"] == "cover",
+            ],
+            [
+                +trades["shares"],
+                -trades["shares"],
+                -trades["shares"],
+                +trades["shares"],
+            ],
+            default=0.0,
+        )
         tickers.update([t for t in trades["ticker"].unique() if t])
 
     tickers = sorted([t for t in tickers if t])
@@ -906,7 +1045,11 @@ def compute_dividend_accrual_quarterly(
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
 ) -> dict:
-    start = portfolio_chart_start_date(pname, meta, txns_all)
+    """
+    Uses yfinance dividend-per-share events and multiplies by LONG shares held on that date.
+    (Short borrow costs / dividend-in-lieu are not modeled.)
+    """
+    start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
     shares_df = compute_daily_shares_df(pname, meta, txns_all, baseline_all, end)
@@ -925,16 +1068,17 @@ def compute_dividend_accrual_quarterly(
             d = pd.to_datetime(d).normalize()
             if d not in shares_df.index:
                 continue
-            sh = float(shares_df.at[d, t])
-            if sh <= 1e-12:
+            sh_net = float(shares_df.at[d, t])
+            sh_long = max(sh_net, 0.0)
+            if sh_long <= 1e-12:
                 continue
             events.append(
                 {
                     "ticker": t,
                     "div_date": d,
                     "div_per_share": float(v),
-                    "shares": sh,
-                    "div_cash": float(v) * sh,
+                    "shares": sh_long,
+                    "div_cash": float(v) * sh_long,
                     "quarter": str(d.to_period("Q")),
                     "quarter_end": d.to_period("Q").end_time.normalize(),
                 }
@@ -1009,7 +1153,7 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     if snap["start_mode"] == "snapshot_start":
         st.info(
             f"Snapshot portfolio — tracking boundary starts {snap['as_of'].date()}. "
-            f"Baseline lots represent holdings as of that date."
+            f"Baseline lots represent holdings as of that date (long shares positive, short shares negative)."
         )
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
@@ -1017,7 +1161,7 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Starting Cash", f"${snap['starting_cash']:,.2f}")
     c2.metric("Cash", f"${snap['cash']:,.2f}")
-    c3.metric("Market Value", f"${snap['market_value']:,.2f}")
+    c3.metric("Market Value (signed)", f"${snap['market_value']:,.2f}")
     c4.metric("NAV", f"${snap['nav']:,.2f}")
 
     d1, d2 = st.columns(2)
@@ -1033,14 +1177,14 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     sector_alloc, industry_alloc = build_allocation_tables(snap)
     a1, a2 = st.columns([1, 1])
     with a1:
-        st.markdown("### Sector allocation (incl. cash)")
-        render_sector_pie(sector_alloc, f"{pname} — Sector Allocation")
+        st.markdown("### Sector allocation (ABS exposure incl. cash)")
+        render_sector_pie(sector_alloc, f"{pname} — Sector Exposure (Abs)")
         st.dataframe(
             sector_alloc.assign(weight_pct=(sector_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
             use_container_width=True,
         )
     with a2:
-        st.markdown("### Sector → Industry breakdown (Yahoo Finance)")
+        st.markdown("### Sector → Industry breakdown (ABS exposure, Yahoo Finance)")
         st.dataframe(
             industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
             use_container_width=True,
@@ -1049,7 +1193,7 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     st.markdown("### Contribution to return (P&L contribution by ticker)")
     contrib = build_contribution_table(snap)
     if contrib.empty:
-        st.info("No contribution data yet (need holdings and/or sells/dividends).")
+        st.info("No contribution data yet (need holdings and/or sells/covers/dividends).")
     else:
         st.dataframe(contrib, use_container_width=True)
         chart_df = contrib.set_index("ticker")[["total_contribution"]]
@@ -1057,7 +1201,7 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
 
     st.markdown("### Dividend tracker (estimated)")
     if divpack["quarterly"] is None or divpack["quarterly"].empty:
-        st.info("No dividend events found for held tickers in this period.")
+        st.info("No dividend events found for held LONG tickers in this period.")
     else:
         st.dataframe(divpack["quarterly"], use_container_width=True)
         st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
@@ -1092,21 +1236,22 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
 
     st.divider()
     if not snap["holdings"].empty:
-        st.markdown("### Holdings")
+        st.markdown("### Holdings (net shares can be negative for shorts)")
         st.dataframe(snap["holdings"], use_container_width=True)
 
     if not snap["lots"].empty:
-        st.markdown("### Open lots (baseline + buys)")
+        st.markdown("### Open lots (baseline + trades) — LONG & SHORT")
         st.dataframe(snap["lots"].sort_values(["ticker", "buy_date"]), use_container_width=True)
 
     if not snap["realized"].empty:
         rv = snap["realized"].copy()
+        # keep long-style % for reference; shorts rely on pnl
         rv["realized_return_%"] = np.where(
             rv["buy_price"] > 0,
             ((rv["sell_price"] / rv["buy_price"]) - 1.0) * 100.0,
             np.nan,
         )
-        st.markdown("### Realized matches (per lot)")
+        st.markdown("### Realized matches (per lot) — sells & covers")
         st.dataframe(rv.sort_values(["sell_date", "ticker"], ascending=False), use_container_width=True)
 
     st.markdown("### Transactions (filtered by boundary when snapshot)")
@@ -1263,6 +1408,9 @@ if is_admin:
     st.markdown("---")
     st.header("Admin")
 
+    # =========================
+    # Create portfolio (TOP)
+    # =========================
     st.subheader("Create portfolio")
     with st.form("create_portfolio_form", clear_on_submit=True):
         new_name = st.text_input("Name", placeholder="e.g., Long Only, Trading, IRA")
@@ -1300,9 +1448,15 @@ if is_admin:
 
     st.divider()
 
+    # =========================
+    # Active portfolio selector
+    # =========================
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
+    # =========================
+    # Tabs
+    # =========================
     admin_tabs = st.tabs(["Transactions", "Portfolio Settings", "Baseline lots", "Documentation"])
 
     # -----------------------
@@ -1329,10 +1483,11 @@ if is_admin:
         add_txn = False
 
         with st.form("add_txn_form", clear_on_submit=False):
-            txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0)
+            txn_type = st.selectbox("Type", ["buy", "sell", "short", "cover", "dividend"], index=0)
             t_date = st.date_input("Date", value=date.today())
 
-            if txn_type in ["buy", "sell"]:
+            if txn_type in ["buy", "sell", "short", "cover"]:
+                st.caption("Shorting flow: **short** opens/increases a short; **cover** closes/reduces a short.")
                 c1, c2, c3 = st.columns([1, 1, 1])
 
                 with c1:
@@ -1407,7 +1562,7 @@ if is_admin:
         if add_txn:
             txn_type_now = txn_type
 
-            if txn_type_now in ["buy", "sell"]:
+            if txn_type_now in ["buy", "sell", "short", "cover"]:
                 t_ticker_final = str(st.session_state.get(ticker_key, "")).upper().strip()
                 t_shares_final = float(st.session_state.get(shares_key, 0.0))
                 t_price_final = float(st.session_state.get(price_key, 0.0))
@@ -1451,23 +1606,27 @@ if is_admin:
         else:
             disp = p_txns.copy()
             disp["date_str"] = pd.to_datetime(disp["date"]).dt.date.astype(str)
-            disp["desc"] = np.where(
-                disp["type"].isin(["buy", "sell"]),
-                disp["date_str"]
+
+            trade_mask = disp["type"].isin(["buy", "sell", "short", "cover"])
+            disp.loc[trade_mask, "desc"] = (
+                disp.loc[trade_mask, "date_str"]
                 + " | "
-                + disp["type"]
+                + disp.loc[trade_mask, "type"]
                 + " | "
-                + disp["ticker"]
+                + disp.loc[trade_mask, "ticker"]
                 + " | "
-                + disp["shares"].map(lambda x: f"{x:.3f}")
+                + disp.loc[trade_mask, "shares"].map(lambda x: f"{x:.3f}")
                 + " @ "
-                + disp["price"].map(lambda x: f"{x:.2f}"),
-                disp["date_str"]
-                + " | dividend | "
-                + disp["ticker"].fillna("").astype(str)
-                + " | $"
-                + disp["amount"].map(lambda x: f"{x:.2f}"),
+                + disp.loc[trade_mask, "price"].map(lambda x: f"{x:.2f}")
             )
+            disp.loc[~trade_mask, "desc"] = (
+                disp.loc[~trade_mask, "date_str"]
+                + " | dividend | "
+                + disp.loc[~trade_mask, "ticker"].fillna("").astype(str)
+                + " | $"
+                + disp.loc[~trade_mask, "amount"].map(lambda x: f"{x:.2f}")
+            )
+
             disp["display"] = disp["desc"] + " | id=" + disp["txn_id"].astype(str)
 
             choice = st.selectbox("Select transaction", disp["display"].tolist(), key="del_txn_choice")
@@ -1524,28 +1683,34 @@ if is_admin:
             st.info("This portfolio is ledger-complete. Baseline lots are only used for snapshot-start portfolios.")
         else:
             with st.form("add_baseline_form", clear_on_submit=True):
-                c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+                c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
                 with c1:
                     bl_ticker = st.text_input("Ticker", value="AAPL")
                 with c2:
-                    bl_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
+                    bl_side = st.selectbox("Side", ["LONG", "SHORT"], index=0)
                 with c3:
-                    bl_price = st.number_input(
-                        "Cost basis (price)", min_value=0.0, value=100.00, step=0.01, format="%.2f"
-                    )
+                    bl_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
                 with c4:
+                    bl_price = st.number_input(
+                        "Entry / cost basis (price)", min_value=0.0, value=100.00, step=0.01, format="%.2f"
+                    )
+                with c5:
                     bl_date = st.date_input("Acquisition date", value=date.today())
 
                 add_bl = st.form_submit_button("Add baseline lot")
 
             if add_bl:
+                signed_sh = float(round(bl_shares, 3))
+                if bl_side == "SHORT":
+                    signed_sh = -signed_sh
+
                 row = {
                     "lot_id": str(pd.Timestamp.utcnow().value),
                     "portfolio": active,
                     "ticker": _clean_str(bl_ticker).upper(),
                     "buy_date": pd.to_datetime(bl_date),
                     "buy_price": float(bl_price),
-                    "shares_open": float(round(bl_shares, 3)),
+                    "shares_open": signed_sh,
                 }
                 baseline_all = pd.concat([baseline_all, pd.DataFrame([row])], ignore_index=True)
                 save_baseline(baseline_all)
@@ -1553,7 +1718,7 @@ if is_admin:
                 st.rerun()
 
             st.divider()
-            st.write("Current baseline lots")
+            st.write("Current baseline lots (negative shares = short)")
             p_base = baseline_all[baseline_all["portfolio"] == active].copy()
 
             if p_base.empty:
@@ -1594,21 +1759,34 @@ if is_admin:
 **If you have full history (ledger-complete):**
 1. Go to **Portfolio Settings** → set **Start mode** = `ledger_complete`
 2. Set **Starting cash** (cash at the beginning of your ledger)
-3. Enter **all buys/sells/dividends** in **Transactions**
+3. Enter **all trades/dividends** in **Transactions**
 
 **If you only have today's holdings (snapshot-start):**
 1. Go to **Portfolio Settings** → set **Start mode** = `snapshot_start`
 2. Set **As-of date** = the snapshot boundary (usually today)
 3. Set **Starting cash** = cash in the account on the as-of date
-4. Go to **Baseline lots** → add each holding with:
-   - ticker
-   - shares
-   - cost basis (price)
-   - acquisition date (inception date)
-5. Enter only **new** buys/sells/dividends after the as-of date in **Transactions**
+4. Go to **Baseline lots** → add each holding:
+   - LONG positions: Side=LONG, Shares positive
+   - SHORT positions: Side=SHORT, Shares positive (stored as negative internally)
+   - Entry / cost basis price
+   - Acquisition date
+5. Enter only **new** transactions after the as-of date in **Transactions**
+
+### Shorting
+
+- Use **short** to open / increase a short position (cash increases).
+- Use **cover** to buy-to-cover (cash decreases).
+- **sell** is only for reducing LONG shares.
+- **cover** is only for reducing SHORT shares.
+- This app enforces **no negative cash** (no margin loans). If a transaction would make cash go negative, it is rejected.
+
+**Dividends:** estimated dividend accrual is calculated on LONG shares only (does not model borrow costs / dividends-in-lieu on shorts).
 """
         )
 
+    # =========================
+    # Backup download
+    # =========================
     st.divider()
     st.subheader("Backup")
     st.caption("Download a ZIP containing: portfolios.csv, transactions.csv, baseline_lots.csv")
