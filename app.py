@@ -341,7 +341,6 @@ def recommend_close_on_or_before(ticker: str, d: pd.Timestamp) -> tuple[float | 
     return float(s.loc[last_dt]), pd.to_datetime(last_dt)
 
 
-
 @st.cache_data(ttl=86400)
 def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
     rows = []
@@ -356,17 +355,16 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=86400)
+# IMPORTANT FIX:
+# Do NOT cache this helper (Streamlit can't hash DatetimeIndex reliably -> UnhashableParamError).
 def _to_naive_normalized_datetime_index(idx) -> pd.DatetimeIndex:
     """
     Convert any datetime-like index to tz-naive, normalized DatetimeIndex.
     Handles tz-aware indexes returned by yfinance.
     """
     dt = pd.to_datetime(idx, errors="coerce")
-    # If tz-aware, drop timezone safely
     if isinstance(dt, pd.DatetimeIndex) and dt.tz is not None:
         dt = dt.tz_convert(None)
-    # Normalize to midnight
     return pd.DatetimeIndex(dt).normalize()
 
 
@@ -388,7 +386,6 @@ def fetch_dividend_events(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -
     if div is None or len(div) == 0:
         return pd.Series(dtype=float)
 
-    # ---- critical fix: make index tz-naive + normalized ----
     div = div.copy()
     div.index = _to_naive_normalized_datetime_index(div.index)
     div = div.sort_index()
@@ -405,7 +402,6 @@ def fetch_dividend_events(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -
 
     div = div[(div.index >= s) & (div.index <= e)]
     return div.astype(float)
-
 
 
 # ============================================================
@@ -957,7 +953,6 @@ def estimate_dividends_for_portfolio(
     Returns estimated cash dividends based on Yahoo dividend events and shares held.
     Output columns: [date, ticker, dividend_per_share, shares, estimated_amount]
     """
-    # tickers from baseline + trades
     baseline = baseline_all[baseline_all["portfolio"] == pname].copy()
     tickers = set()
     if not baseline.empty:
@@ -972,7 +967,6 @@ def estimate_dividends_for_portfolio(
     if not tickers:
         return pd.DataFrame(columns=["date", "ticker", "dividend_per_share", "shares", "estimated_amount"])
 
-    # unified daily index for share tracking
     idx = pd.date_range(pd.to_datetime(start).normalize(), pd.to_datetime(end).normalize(), freq="D")
     if len(idx) == 0:
         return pd.DataFrame(columns=["date", "ticker", "dividend_per_share", "shares", "estimated_amount"])
@@ -1162,7 +1156,11 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
         div_tx.loc[div_tx["ticker"] == "", "ticker"] = "CASH"
         recorded_total = float(div_tx["amount"].sum())
 
-        by_ticker = div_tx.groupby("ticker", as_index=False).agg(amount=("amount", "sum")).sort_values("amount", ascending=False)
+        by_ticker = (
+            div_tx.groupby("ticker", as_index=False)
+            .agg(amount=("amount", "sum"))
+            .sort_values("amount", ascending=False)
+        )
         st.caption("Recorded dividends (what you entered)")
         st.dataframe(style_multi(by_ticker, money_cols=["amount"]), use_container_width=True)
 
@@ -1193,8 +1191,10 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
             height=260,
         )
 
-        est_by_ticker = est.groupby("ticker", as_index=False).agg(estimated_amount=("estimated_amount", "sum")).sort_values(
-            "estimated_amount", ascending=False
+        est_by_ticker = (
+            est.groupby("ticker", as_index=False)
+            .agg(estimated_amount=("estimated_amount", "sum"))
+            .sort_values("estimated_amount", ascending=False)
         )
         st.dataframe(style_multi(est_by_ticker, money_cols=["estimated_amount"]), use_container_width=True)
 
@@ -1486,12 +1486,15 @@ if is_admin:
         if "txn_price_edited" not in st.session_state:
             st.session_state.txn_price_edited = False
 
-        # Inputs (not in a form so callbacks can update live)
-        txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=["buy", "sell", "dividend"].index(st.session_state.txn_type), key="txn_type")
+        txn_type = st.selectbox(
+            "Type",
+            ["buy", "sell", "dividend"],
+            index=["buy", "sell", "dividend"].index(st.session_state.txn_type),
+            key="txn_type",
+        )
 
         t_date = st.date_input("Date", value=st.session_state.txn_date, key="txn_date", on_change=_update_recommended_price)
 
-        # Shared ticker input (nice cleanup)
         t_ticker = st.text_input(
             "Ticker (blank allowed for dividends)",
             value=st.session_state.txn_ticker,
@@ -1502,13 +1505,19 @@ if is_admin:
         if txn_type in ["buy", "sell"]:
             c1, c2 = st.columns([1, 1])
             with c1:
-                t_shares = st.number_input("Shares", min_value=0.0, value=float(st.session_state.txn_shares), step=0.001, format="%.3f", key="txn_shares")
+                t_shares = st.number_input(
+                    "Shares",
+                    min_value=0.0,
+                    value=float(st.session_state.txn_shares),
+                    step=0.001,
+                    format="%.3f",
+                    key="txn_shares",
+                )
             with c2:
-                # price input + recommendation note
                 def _mark_price_edited():
                     st.session_state.txn_price_edited = True
 
-                price_val = st.number_input(
+                st.number_input(
                     "Price (editable)",
                     min_value=0.0,
                     value=float(st.session_state.txn_price),
@@ -1518,7 +1527,6 @@ if is_admin:
                     on_change=_mark_price_edited,
                 )
 
-            # Recommendation label
             px = st.session_state.get("txn_reco_price", None)
             px_dt = st.session_state.get("txn_reco_price_date", None)
             if px is not None and px_dt is not None:
@@ -1534,8 +1542,14 @@ if is_admin:
             t_amount = np.nan
         else:
             t_shares = np.nan
-            t_price = np.nan
-            t_amount = st.number_input("Dividend amount ($)", min_value=0.0, value=float(st.session_state.txn_amount), step=1.0, format="%.2f", key="txn_amount")
+            t_amount = st.number_input(
+                "Dividend amount ($)",
+                min_value=0.0,
+                value=float(st.session_state.txn_amount),
+                step=1.0,
+                format="%.2f",
+                key="txn_amount",
+            )
 
         col_save, col_reset = st.columns([1, 1])
         with col_save:
