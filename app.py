@@ -1649,9 +1649,38 @@ if is_admin:
 
         st.caption("CSV columns must be exactly: **TICKER | TRANSACTION TYPE | DATE | SHARE COUNT**. Only buy/sell/short/cover are imported.")
         up = st.file_uploader(
-            "Upload CSV",
+            "Upload transactions CSV ❓",
             type=["csv"],
             key=f"bulk_upload_csv__{active}",
+            help="""
+Required CSV format (headers required):
+
+TICKER | TRANSACTION TYPE | DATE | SHARE COUNT
+
+• TICKER
+  - Stock ticker (e.g., AAPL, SPY)
+  - Case-insensitive (will be uppercased)
+
+• TRANSACTION TYPE
+  - Must be one of:
+    buy, sell, short, cover
+  - Anything else (dividend, cash, fees, etc.) is ignored
+
+• DATE
+  - Any standard date format (YYYY-MM-DD recommended)
+
+• SHARE COUNT
+  - Must be a positive number
+  - Parentheses for negatives are allowed (e.g. (30))
+  - Direction is inferred from TRANSACTION TYPE
+
+Notes:
+• Prices are automatically filled using Yahoo Finance
+  (close on or before the transaction date)
+• Shorts increase cash; covers decrease cash
+• Import can Append or Replace the selected portfolio
+• Invalid rows are skipped and shown before import
+"""
         )
 
         mode = st.radio(
