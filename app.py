@@ -2,6 +2,7 @@
 import hmac
 from datetime import date
 from pathlib import Path
+import re
 
 import numpy as np
 import pandas as pd
@@ -337,6 +338,65 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 
 
 # =========================
+# 2d) Bulk upload helpers (CSV: TICKER | TRANSACTION TYPE | DATE | SHARE COUNT)
+# =========================
+def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
+    """
+    Expected columns:
+      TICKER | TRANSACTION TYPE | DATE | SHARE COUNT
+
+    Returns normalized df:
+      ticker, type, date, shares
+    Only keeps type in {buy, sell, short, cover}.
+    """
+    df = pd.read_csv(uploaded_file)
+    df.columns = [str(c).strip().upper() for c in df.columns]
+
+    required = ["TICKER", "TRANSACTION TYPE", "DATE", "SHARE COUNT"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    out = pd.DataFrame()
+    out["ticker"] = df["TICKER"].astype(str).str.upper().str.strip()
+    out["type"] = df["TRANSACTION TYPE"].astype(str).str.lower().str.strip()
+    out["date"] = pd.to_datetime(df["DATE"], errors="coerce").dt.normalize()
+    out["shares"] = pd.to_numeric(df["SHARE COUNT"], errors="coerce").abs()
+
+    out = out[out["type"].isin(["buy", "sell", "short", "cover"])].copy()
+    out = out.dropna(subset=["ticker", "type", "date", "shares"])
+    out = out[(out["ticker"] != "") & (out["shares"] > 0)]
+    return out.reset_index(drop=True)
+
+
+def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Adds a price column via fetch_close_on_or_before(ticker, date).
+    Returns: (good_df, bad_df)
+    """
+    if import_df.empty:
+        return import_df, pd.DataFrame()
+
+    rows = []
+    failed = []
+
+    for _, r in import_df.iterrows():
+        t = str(r["ticker"]).upper().strip()
+        d = pd.to_datetime(r["date"]).date()
+        px = fetch_close_on_or_before(t, d)
+
+        if px is None or (not np.isfinite(px)):
+            failed.append({**r.to_dict(), "reason": "Could not fetch close on/before date"})
+            continue
+
+        rows.append({**r.to_dict(), "price": float(px)})
+
+    good = pd.DataFrame(rows)
+    bad = pd.DataFrame(failed)
+    return good, bad
+
+
+# =========================
 # 3) Lot engine + accounting (LONG + SHORT)
 # =========================
 def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, side: str):
@@ -374,7 +434,6 @@ def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, si
                 continue
             avail = abs(sh_open)
             take = min(remaining, avail)
-            # shares_open is negative; move toward 0 by adding take
             lot["shares_open"] = sh_open + take
             remaining -= take
             realized_rows.append((lot, take))
@@ -406,7 +465,6 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
 
     lots_by_ticker: dict[str, list[dict]] = {}
 
-    # baseline lots (can be long or short)
     if not baseline.empty:
         for _, r in baseline.iterrows():
             t = str(r["ticker"]).upper().strip()
@@ -416,7 +474,7 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
                     "ticker": t,
                     "buy_date": pd.to_datetime(r["buy_date"]).date(),
                     "buy_price": float(r["buy_price"]),
-                    "shares_open": float(r["shares_open"]),  # signed
+                    "shares_open": float(r["shares_open"]),
                 }
             )
 
@@ -440,14 +498,12 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
         lots_by_ticker.setdefault(tkr, [])
 
         if typ == "buy":
-            # open/increase long
             lots_by_ticker[tkr].append(
                 {"lot_id": tid, "ticker": tkr, "buy_date": dt, "buy_price": px, "shares_open": +sh}
             )
 
         elif typ == "sell":
-            # reduce long only
-            matches, rem = apply_reduce_to_lots(lots_by_ticker[tkr], sh, method, side="LONG")
+            matches, _ = apply_reduce_to_lots(lots_by_ticker[tkr], sh, method, side="LONG")
             for lot, shares_sold in matches:
                 pnl = shares_sold * (px - float(lot["buy_price"]))
                 realized.append(
@@ -463,17 +519,14 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
                         "pnl": pnl,
                     }
                 )
-            # if rem > 0, validation should have prevented it.
 
         elif typ == "short":
-            # open/increase short: store entry price in buy_price, shares_open negative
             lots_by_ticker[tkr].append(
                 {"lot_id": tid, "ticker": tkr, "buy_date": dt, "buy_price": px, "shares_open": -sh}
             )
 
         elif typ == "cover":
-            # reduce short only
-            matches, rem = apply_reduce_to_lots(lots_by_ticker[tkr], sh, method, side="SHORT")
+            matches, _ = apply_reduce_to_lots(lots_by_ticker[tkr], sh, method, side="SHORT")
             for lot, shares_cov in matches:
                 entry = float(lot["buy_price"])
                 pnl = shares_cov * (entry - px)
@@ -482,15 +535,14 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
                         "sale_id": tid,
                         "ticker": tkr,
                         "position": "SHORT",
-                        "buy_date": lot["buy_date"],   # short open date
-                        "buy_price": entry,            # short entry
-                        "sell_date": dt,               # cover date
-                        "sell_price": px,              # cover price
+                        "buy_date": lot["buy_date"],
+                        "buy_price": entry,
+                        "sell_date": dt,
+                        "sell_price": px,
                         "shares_sold": shares_cov,
                         "pnl": pnl,
                     }
                 )
-            # if rem > 0, validation should have prevented it.
 
     open_lots = []
     for _, lots in lots_by_ticker.items():
@@ -550,7 +602,6 @@ def validate_candidate_state(
         if (txns["date"] < as_of).any():
             return False, f"Snapshot portfolios cannot have transactions before as-of date ({as_of.date()})."
 
-    # cash must never go negative
     cash = starting_cash
     for _, r in txns.iterrows():
         cash += cash_delta(r)
@@ -561,11 +612,9 @@ def validate_candidate_state(
     if trades.empty:
         return True, ""
 
-    # Track long and short separately
     long_shares = {}
-    short_shares = {}  # positive number = shares short
+    short_shares = {}
 
-    # baseline can be long (+) or short (-)
     if not portfolio_baseline.empty:
         for _, r in portfolio_baseline.iterrows():
             t = str(r["ticker"]).upper().strip()
@@ -623,12 +672,7 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
         lots_view = open_lots.copy()
         lots_view["last_price"] = lots_view["ticker"].map(live).astype(float)
 
-        # signed MV (short positions negative MV)
         lots_view["market_value"] = lots_view["shares_open"] * lots_view["last_price"]
-
-        # unified unrealized pnl works with signed shares:
-        # long: +sh*(last-entry)
-        # short: -sh*(last-entry) = +abs(sh)*(entry-last)
         lots_view["unrealized_pnl"] = lots_view["shares_open"] * (lots_view["last_price"] - lots_view["buy_price"])
 
         lots_view["position"] = np.where(lots_view["shares_open"] >= 0, "LONG", "SHORT")
@@ -637,7 +681,6 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
             ((lots_view["last_price"] / lots_view["buy_price"]) - 1.0) * 100.0,
             np.nan,
         )
-        # For shorts, the above % is not the usual short return; keep it as "price return" and rely on PnL.
 
         tmp = lots_view.copy()
         tmp["abs_shares"] = tmp["shares_open"].abs()
@@ -741,7 +784,6 @@ def compute_nav_series_for_portfolio(
 
         cash = starting_cash + cash_flow.cumsum()
 
-    # baseline net shares can include shorts
     baseline_shares = {}
     if not baseline.empty:
         for _, r in baseline.iterrows():
@@ -1245,7 +1287,6 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
 
     if not snap["realized"].empty:
         rv = snap["realized"].copy()
-        # keep long-style % for reference; shorts rely on pnl
         rv["realized_return_%"] = np.where(
             rv["buy_price"] > 0,
             ((rv["sell_price"] / rv["buy_price"]) - 1.0) * 100.0,
@@ -1482,6 +1523,9 @@ if is_admin:
         refresh_pressed = False
         add_txn = False
 
+        # -----------------------
+        # Add transaction (manual)
+        # -----------------------
         with st.form("add_txn_form", clear_on_submit=False):
             txn_type = st.selectbox("Type", ["buy", "sell", "short", "cover", "dividend"], index=0)
             t_date = st.date_input("Date", value=date.today())
@@ -1597,6 +1641,109 @@ if is_admin:
                 st.success("Saved.")
                 st.rerun()
 
+        # -----------------------
+        # Bulk upload (beneath Add transaction)
+        # -----------------------
+        st.divider()
+        st.subheader("Bulk upload (CSV)")
+
+        st.caption("CSV columns must be exactly: **TICKER | TRANSACTION TYPE | DATE | SHARE COUNT**. Only buy/sell/short/cover are imported.")
+        up = st.file_uploader(
+            "Upload CSV",
+            type=["csv"],
+            key=f"bulk_upload_csv__{active}",
+        )
+
+        mode = st.radio(
+            "Import mode for this portfolio",
+            ["Append", "Replace"],
+            horizontal=True,
+            key=f"bulk_mode__{active}",
+        )
+
+        preview_key_good = f"bulk_good__{active}"
+        preview_key_bad = f"bulk_bad__{active}"
+        preview_key_raw = f"bulk_raw__{active}"
+
+        if up is not None:
+            try:
+                raw_import = parse_simple_txn_csv(up)
+                st.session_state[preview_key_raw] = raw_import
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+                st.session_state[preview_key_raw] = pd.DataFrame()
+
+        raw_import = st.session_state.get(preview_key_raw, pd.DataFrame())
+
+        if isinstance(raw_import, pd.DataFrame) and not raw_import.empty:
+            st.write("Parsed rows (pre-price):")
+            st.dataframe(raw_import, use_container_width=True)
+
+            if st.button("Preview with prices", key=f"bulk_preview_btn__{active}"):
+                good, bad = enrich_import_with_prices(raw_import)
+                st.session_state[preview_key_good] = good
+                st.session_state[preview_key_bad] = bad
+                st.rerun()
+
+        good = st.session_state.get(preview_key_good, pd.DataFrame())
+        bad = st.session_state.get(preview_key_bad, pd.DataFrame())
+
+        if isinstance(bad, pd.DataFrame) and not bad.empty:
+            st.warning(f"Skipped: {len(bad)} rows (could not fetch price).")
+            st.dataframe(bad, use_container_width=True)
+
+        if isinstance(good, pd.DataFrame) and not good.empty:
+            st.success(f"Ready to import: {len(good)} rows (prices found).")
+            st.dataframe(good, use_container_width=True)
+
+            if st.button("✅ Import into portfolio", type="primary", key=f"bulk_import_btn__{active}"):
+                # Build app-schema rows
+                rows = []
+                base_id = pd.Timestamp.utcnow().value
+                for i, r in good.reset_index(drop=True).iterrows():
+                    rows.append(
+                        {
+                            "txn_id": str(base_id + i),
+                            "portfolio": active,
+                            "date": pd.to_datetime(r["date"]),
+                            "type": str(r["type"]).lower(),
+                            "ticker": str(r["ticker"]).upper().strip(),
+                            "shares": float(round(float(r["shares"]), 3)),
+                            "price": float(r["price"]),
+                            "amount": np.nan,
+                        }
+                    )
+
+                imported_df = pd.DataFrame(rows)
+
+                if mode == "Replace":
+                    candidate_txns = txns_all[txns_all["portfolio"] != active].copy()
+                    candidate_txns = pd.concat([candidate_txns, imported_df], ignore_index=True)
+                else:
+                    candidate_txns = pd.concat([txns_all, imported_df], ignore_index=True)
+
+                p_txns2 = candidate_txns[candidate_txns["portfolio"] == active].copy()
+                p_base2 = baseline_all[baseline_all["portfolio"] == active].copy()
+
+                ok, msg = validate_candidate_state(meta, p_txns2, p_base2, match_method)
+                if not ok:
+                    st.error(f"Import rejected: {msg}")
+                else:
+                    txns_all = candidate_txns
+                    save_txns(txns_all)
+                    st.success(f"Imported {len(imported_df)} transactions into '{active}' ({mode}).")
+
+                    # clear preview state so you don't accidentally double-import
+                    st.session_state.pop(preview_key_good, None)
+                    st.session_state.pop(preview_key_bad, None)
+                    st.session_state.pop(preview_key_raw, None)
+                    st.rerun()
+        elif up is not None and isinstance(raw_import, pd.DataFrame) and raw_import.empty:
+            st.info("No valid buy/sell/short/cover rows found in this file (or required columns missing).")
+
+        # -----------------------
+        # Delete transaction
+        # -----------------------
         st.divider()
         st.subheader("Delete transaction")
 
