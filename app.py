@@ -264,6 +264,59 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 
 
 # =========================
+# 2c) Recommended close for txn date
+# =========================
+@st.cache_data(ttl=86400)
+def fetch_recommended_close(ticker: str, d: date) -> float | None:
+    """
+    Recommended price = Close on the transaction date (auto_adjust=True).
+    If date is non-trading, falls back to the most recent prior trading close.
+    If still not found, tries the next available trading close.
+    """
+    t = str(ticker).upper().strip()
+    if not t:
+        return None
+
+    d0 = pd.to_datetime(d).normalize()
+
+    # Look back up to 7 days for prior trading close
+    start = (d0 - pd.Timedelta(days=7)).date()
+    end = (d0 + pd.Timedelta(days=1)).date()
+    try:
+        px = yf.download(t, start=start, end=end, interval="1d", auto_adjust=True, progress=False)
+        if not px.empty and "Close" in px.columns:
+            px.index = pd.to_datetime(px.index).normalize()
+            px = px.sort_index()
+            prior = px.loc[px.index <= d0, "Close"]
+            if not prior.empty:
+                v = float(prior.iloc[-1])
+                return v if np.isfinite(v) else None
+    except Exception:
+        pass
+
+    # Look forward up to 7 days for next trading close
+    try:
+        start2 = d0.date()
+        end2 = (d0 + pd.Timedelta(days=7)).date()
+        px2 = yf.download(t, start=start2, end=end2, interval="1d", auto_adjust=True, progress=False)
+        if not px2.empty and "Close" in px2.columns:
+            px2.index = pd.to_datetime(px2.index).normalize()
+            px2 = px2.sort_index()
+            fwd = px2.loc[px2.index >= d0, "Close"]
+            if not fwd.empty:
+                v = float(fwd.iloc[0])
+                return v if np.isfinite(v) else None
+    except Exception:
+        pass
+
+    return None
+
+
+def _mark_price_overridden():
+    st.session_state["txn_price_overridden"] = True
+
+
+# =========================
 # 3) Lot engine + accounting
 # =========================
 def apply_sell_to_lots(lots: list[dict], sell_shares: float, method: str):
@@ -650,9 +703,8 @@ def compute_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series) -> dict:
     var = float(df["rm"].var())
     beta = np.nan if var == 0 else cov / var
 
-    # intercept
     alpha_week = float(df["rp"].mean() - beta * df["rm"].mean())
-    alpha_ann = float((1.0 + alpha_week) ** 52 - 1.0)  # ok even if you are on daily; it's “weekly-ish” display
+    alpha_ann = float((1.0 + alpha_week) ** 52 - 1.0)
 
     corr = float(df["rp"].corr(df["rm"]))
     r2 = corr * corr if np.isfinite(corr) else np.nan
@@ -686,14 +738,8 @@ def rolling_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series, window: int = 26)
 
 
 def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-      - sector_alloc_df: columns [label, market_value, weight, sector]
-      - industry_alloc_df: columns [sector, industry, market_value, weight]
-    """
     rows = []
 
-    # equities
     if not snap["holdings"].empty:
         for _, r in snap["holdings"].iterrows():
             rows.append(
@@ -704,17 +750,13 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
                 }
             )
 
-    # cash as its own "position"
     rows.append({"ticker": "", "label": "CASH", "market_value": float(snap["cash"])})
 
     df = pd.DataFrame(rows)
     df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce").fillna(0.0)
 
     total = float(df["market_value"].sum())
-    if total <= 0:
-        df["weight"] = 0.0
-    else:
-        df["weight"] = df["market_value"] / total
+    df["weight"] = 0.0 if total <= 0 else (df["market_value"] / total)
 
     tickers = sorted([t for t in df["ticker"].unique().tolist() if t])
     meta = fetch_sector_industry(tickers) if tickers else pd.DataFrame(columns=["ticker", "sector", "industry"])
@@ -725,7 +767,6 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df["sector"] = df["sector"].fillna("Unknown")
     df["industry"] = df["industry"].fillna("Unknown")
 
-    # sector-level
     sector_alloc = (
         df.groupby(["sector"], as_index=False)
         .agg(market_value=("market_value", "sum"))
@@ -734,7 +775,6 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     sector_total = float(sector_alloc["market_value"].sum())
     sector_alloc["weight"] = np.where(sector_total > 0, sector_alloc["market_value"] / sector_total, 0.0)
 
-    # industry-level (nested within sector)
     industry_alloc = (
         df.groupby(["sector", "industry"], as_index=False)
         .agg(market_value=("market_value", "sum"))
@@ -747,11 +787,6 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def build_contribution_table(snap: dict) -> pd.DataFrame:
-    """
-    Contribution to P&L by ticker:
-      unrealized (open lots) + realized (sales) + dividends (cashflow)
-    Includes a CASH row for unlabeled dividends.
-    """
     unreal = pd.DataFrame(columns=["ticker", "unrealized_pnl"])
     if not snap["lots"].empty:
         unreal = snap["lots"].groupby("ticker", as_index=False).agg(unrealized_pnl=("unrealized_pnl", "sum"))
@@ -850,7 +885,6 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
 
-    # KPIs
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Starting Cash", f"${snap['starting_cash']:,.2f}")
     c2.metric("Cash", f"${snap['cash']:,.2f}")
@@ -861,11 +895,9 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     d1.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
     d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
 
-    # Tier-1 charts
     st.divider()
     st.markdown("## Tier 1 Analytics")
 
-    # Sector allocation pie + sector->industry breakdown
     sector_alloc, industry_alloc = build_allocation_tables(snap)
     a1, a2 = st.columns([1, 1])
     with a1:
@@ -882,18 +914,15 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
             use_container_width=True,
         )
 
-    # Contribution to return
     st.markdown("### Contribution to return (P&L contribution by ticker)")
     contrib = build_contribution_table(snap)
     if contrib.empty:
         st.info("No contribution data yet (need holdings and/or sells/dividends).")
     else:
         st.dataframe(contrib, use_container_width=True)
-        # quick chart
         chart_df = contrib.set_index("ticker")[["total_contribution"]]
         st.bar_chart(chart_df)
 
-    # Drawdown + Beta/Alpha (if nav_series and spy provided)
     st.markdown("### Drawdown")
     if nav_series is None or nav_series.dropna().empty:
         st.info("No NAV series yet for drawdown.")
@@ -922,7 +951,6 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
                 st.caption("Rolling alpha (annualized, 26 periods)")
                 st.line_chart(roll[["alpha_ann"]])
 
-    # Existing tables
     st.divider()
     if not snap["holdings"].empty:
         st.markdown("### Holdings")
@@ -1039,7 +1067,6 @@ with public_tabs[0]:
 # ----------------------------
 # Individual portfolio tabs
 # ----------------------------
-# Build a single SPY series aligned to each portfolio at render time
 for i, p in enumerate(portfolio_names, start=1):
     with public_tabs[i]:
         st.markdown(f"## {p}")
@@ -1142,6 +1169,14 @@ if is_admin:
     with admin_tabs[0]:
         st.subheader("Transactions")
 
+        # Session init for recommended pricing UX
+        if "txn_price_overridden" not in st.session_state:
+            st.session_state["txn_price_overridden"] = False
+        if "txn_use_recommended" not in st.session_state:
+            st.session_state["txn_use_recommended"] = True
+        if "txn_use_recommended_prev" not in st.session_state:
+            st.session_state["txn_use_recommended_prev"] = True
+
         with st.form("add_txn_form", clear_on_submit=True):
             txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0)
             t_date = st.date_input("Date", value=date.today())
@@ -1149,12 +1184,52 @@ if is_admin:
             if txn_type in ["buy", "sell"]:
                 c1, c2, c3 = st.columns([1, 1, 1])
                 with c1:
-                    t_ticker = st.text_input("Ticker", value="AAPL")
+                    t_ticker = st.text_input("Ticker", value="AAPL", key="txn_ticker")
                 with c2:
-                    t_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f")
+                    t_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f", key="txn_shares")
+
+                rec = fetch_recommended_close(t_ticker, t_date)
+
+                use_rec = st.checkbox(
+                    "Use recommended close price",
+                    value=bool(st.session_state["txn_use_recommended"]),
+                    key="txn_use_recommended",
+                )
+
+                # If user toggles checkbox OFF->ON, re-sync and allow overwrite again
+                if (not st.session_state["txn_use_recommended_prev"]) and use_rec:
+                    st.session_state["txn_price_overridden"] = False
+                    if rec is not None:
+                        st.session_state["txn_price"] = float(rec)
+
+                # Auto-sync only when enabled and not manually overridden
+                if use_rec and (not st.session_state["txn_price_overridden"]) and rec is not None:
+                    st.session_state["txn_price"] = float(rec)
+
                 with c3:
-                    t_price = st.number_input("Price", min_value=0.0, value=100.00, step=0.01, format="%.2f")
+                    if "txn_price" not in st.session_state:
+                        st.session_state["txn_price"] = float(rec) if rec is not None else 100.00
+
+                    t_price = st.number_input(
+                        "Price",
+                        min_value=0.0,
+                        value=float(st.session_state["txn_price"]),
+                        step=0.01,
+                        format="%.2f",
+                        key="txn_price",
+                        on_change=_mark_price_overridden,
+                    )
+
+                if rec is None:
+                    st.caption("Could not fetch a recommended close price for this ticker/date.")
+                else:
+                    st.caption(f"Recommended: {t_ticker.upper()} close ≈ ${rec:,.2f} (auto-adjusted). Edit anytime.")
+
                 t_amount = np.nan
+
+                # track checkbox state across reruns
+                st.session_state["txn_use_recommended_prev"] = bool(use_rec)
+
             else:
                 c1, c2 = st.columns([1, 1])
                 with c1:
@@ -1190,6 +1265,10 @@ if is_admin:
             else:
                 txns_all = candidate_txns
                 save_txns(txns_all)
+
+                # ✅ nice touch: reset override so next entry re-autofills cleanly
+                st.session_state["txn_price_overridden"] = False
+
                 st.success("Saved.")
                 st.rerun()
 
