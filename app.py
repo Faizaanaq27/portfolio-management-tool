@@ -1,3 +1,4 @@
+# app.py
 import hmac
 from datetime import date
 from pathlib import Path
@@ -203,6 +204,9 @@ def save_baseline(df: pd.DataFrame) -> None:
     out.to_csv(BASELINE_PATH, index=False)
 
 
+# =========================
+# Prices (Yahoo Finance)
+# =========================
 @st.cache_data(ttl=600)
 def fetch_last_prices(tickers: list[str]) -> pd.Series:
     if not tickers:
@@ -243,14 +247,50 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
     return px
 
 
+@st.cache_data(ttl=900)
+def fetch_recommended_close(ticker: str, d: date) -> float | None:
+    """
+    Returns the Yahoo Finance *adjusted* close (auto_adjust=True) on that date if available.
+    Falls back to last available close before that date (within a short window).
+    """
+    t = str(ticker).upper().strip()
+    if not t:
+        return None
+
+    dt = pd.to_datetime(d).normalize()
+    start = dt - pd.Timedelta(days=7)
+    end = dt + pd.Timedelta(days=1)
+
+    px = fetch_price_history([t], start, end)
+    if px.empty or t not in px.columns:
+        return None
+
+    s = px[t].dropna()
+    if s.empty:
+        return None
+
+    # exact date if present
+    if dt in s.index:
+        return float(s.loc[dt])
+
+    # otherwise, last available prior
+    prior = s[s.index <= dt]
+    if not prior.empty:
+        return float(prior.iloc[-1])
+
+    # last resort: earliest after
+    after = s[s.index > dt]
+    if not after.empty:
+        return float(after.iloc[0])
+
+    return None
+
+
 # =========================
 # 2b) Yahoo sector/industry (cached)
 # =========================
 @st.cache_data(ttl=86400)
 def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
-    """
-    Pulls sector/industry from Yahoo via yfinance. Best-effort; may be missing for some tickers.
-    """
     rows = []
     for t in sorted(set([str(x).upper().strip() for x in tickers if str(x).strip()])):
         try:
@@ -261,59 +301,6 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
             sector, industry = "Unknown", "Unknown"
         rows.append({"ticker": t, "sector": sector, "industry": industry})
     return pd.DataFrame(rows)
-
-
-# =========================
-# 2c) Recommended close for txn date
-# =========================
-@st.cache_data(ttl=86400)
-def fetch_recommended_close(ticker: str, d: date) -> float | None:
-    """
-    Recommended price = Close on the transaction date (auto_adjust=True).
-    If date is non-trading, falls back to the most recent prior trading close.
-    If still not found, tries the next available trading close.
-    """
-    t = str(ticker).upper().strip()
-    if not t:
-        return None
-
-    d0 = pd.to_datetime(d).normalize()
-
-    # Look back up to 7 days for prior trading close
-    start = (d0 - pd.Timedelta(days=7)).date()
-    end = (d0 + pd.Timedelta(days=1)).date()
-    try:
-        px = yf.download(t, start=start, end=end, interval="1d", auto_adjust=True, progress=False)
-        if not px.empty and "Close" in px.columns:
-            px.index = pd.to_datetime(px.index).normalize()
-            px = px.sort_index()
-            prior = px.loc[px.index <= d0, "Close"]
-            if not prior.empty:
-                v = float(prior.iloc[-1])
-                return v if np.isfinite(v) else None
-    except Exception:
-        pass
-
-    # Look forward up to 7 days for next trading close
-    try:
-        start2 = d0.date()
-        end2 = (d0 + pd.Timedelta(days=7)).date()
-        px2 = yf.download(t, start=start2, end=end2, interval="1d", auto_adjust=True, progress=False)
-        if not px2.empty and "Close" in px2.columns:
-            px2.index = pd.to_datetime(px2.index).normalize()
-            px2 = px2.sort_index()
-            fwd = px2.loc[px2.index >= d0, "Close"]
-            if not fwd.empty:
-                v = float(fwd.iloc[0])
-                return v if np.isfinite(v) else None
-    except Exception:
-        pass
-
-    return None
-
-
-def _mark_price_overridden():
-    st.session_state["txn_price_overridden"] = True
 
 
 # =========================
@@ -341,7 +328,7 @@ def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, metho
     open_cols = ["lot_id", "ticker", "buy_date", "buy_price", "shares_open"]
     real_cols = ["sale_id", "ticker", "buy_date", "buy_price", "sell_date", "sell_price", "shares_sold", "pnl"]
 
-    lots_by_ticker = {}
+    lots_by_ticker: dict[str, list[dict]] = {}
 
     if not baseline.empty:
         for _, r in baseline.iterrows():
@@ -460,7 +447,7 @@ def validate_candidate_state(
     if trades.empty:
         return True, ""
 
-    inv = {}
+    inv: dict[str, float] = {}
     if not portfolio_baseline.empty:
         for _, r in portfolio_baseline.iterrows():
             t = str(r["ticker"]).upper().strip()
@@ -687,11 +674,6 @@ def compute_drawdown(nav: pd.Series) -> pd.Series:
 
 
 def compute_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series) -> dict:
-    """
-    Uses simple returns, aligned on shared dates.
-    Regression form: r_p = alpha + beta * r_m + eps
-    alpha reported annualized (simple compounding) for display.
-    """
     rp = port_nav.pct_change().replace([np.inf, -np.inf], np.nan)
     rm = mkt_px.pct_change().replace([np.inf, -np.inf], np.nan)
 
@@ -719,9 +701,7 @@ def rolling_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series, window: int = 26)
     if df.empty or len(df) < window:
         return pd.DataFrame(columns=["beta", "alpha_ann"])
 
-    betas = []
-    alphas = []
-    idx = []
+    betas, alphas, idx = [], [], []
     for i in range(window, len(df) + 1):
         w = df.iloc[i - window : i]
         cov = float(w["rp"].cov(w["rm"]))
@@ -756,7 +736,7 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce").fillna(0.0)
 
     total = float(df["market_value"].sum())
-    df["weight"] = 0.0 if total <= 0 else (df["market_value"] / total)
+    df["weight"] = 0.0 if total <= 0 else df["market_value"] / total
 
     tickers = sorted([t for t in df["ticker"].unique().tolist() if t])
     meta = fetch_sector_industry(tickers) if tickers else pd.DataFrame(columns=["ticker", "sector", "industry"])
@@ -1012,7 +992,7 @@ with public_tabs[0]:
         agg_nav_last = 0.0
         agg_nav = pd.Series(dtype=float)
     else:
-        agg_nav = nav_df.fillna(method="ffill").sum(axis=1)
+        agg_nav = nav_df.ffill().sum(axis=1)
         agg_nav_last = float(agg_nav.iloc[-1])
 
     total_cash = float(np.nansum(list(cash_now_by_port.values()))) if cash_now_by_port else 0.0
@@ -1153,95 +1133,121 @@ if is_admin:
     st.divider()
 
     # =========================
-    # Active portfolio selector (BELOW create)
+    # Active portfolio selector
     # =========================
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
     # =========================
-    # Tabs (Transactions FIRST = default)
+    # Tabs
     # =========================
     admin_tabs = st.tabs(["Transactions", "Portfolio Settings", "Baseline lots", "Documentation"])
 
     # -----------------------
-    # Transactions tab (DEFAULT)
+    # Transactions tab
     # -----------------------
     with admin_tabs[0]:
         st.subheader("Transactions")
 
-        # Session init for recommended pricing UX
-        if "txn_price_overridden" not in st.session_state:
-            st.session_state["txn_price_overridden"] = False
-        if "txn_use_recommended" not in st.session_state:
-            st.session_state["txn_use_recommended"] = True
-        if "txn_use_recommended_prev" not in st.session_state:
-            st.session_state["txn_use_recommended_prev"] = True
+        # =========================================================
+        # ✅ Add transaction (NO st.form) so the recommended price updates live
+        # =========================================================
+        st.markdown("### Add transaction")
 
-        with st.form("add_txn_form", clear_on_submit=True):
-            txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0)
-            t_date = st.date_input("Date", value=date.today())
+        # init session defaults once
+        st.session_state.setdefault("txn_type", "buy")
+        st.session_state.setdefault("txn_date", date.today())
+        st.session_state.setdefault("txn_ticker", "AAPL")
+        st.session_state.setdefault("txn_shares", 1.000)
+        st.session_state.setdefault("txn_amount", 0.0)
+        st.session_state.setdefault("txn_use_recommended", True)
+        st.session_state.setdefault("txn_use_recommended_prev", True)
+        st.session_state.setdefault("txn_price_overridden", False)
 
-            if txn_type in ["buy", "sell"]:
-                c1, c2, c3 = st.columns([1, 1, 1])
-                with c1:
-                    t_ticker = st.text_input("Ticker", value="AAPL", key="txn_ticker")
-                with c2:
-                    t_shares = st.number_input("Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f", key="txn_shares")
+        txn_type = st.selectbox(
+            "Type",
+            ["buy", "sell", "dividend"],
+            index=["buy", "sell", "dividend"].index(st.session_state["txn_type"]),
+            key="txn_type",
+        )
+        t_date = st.date_input("Date", value=st.session_state["txn_date"], key="txn_date")
 
-                rec = fetch_recommended_close(t_ticker, t_date)
-
-                use_rec = st.checkbox(
-                    "Use recommended close price",
-                    value=bool(st.session_state["txn_use_recommended"]),
-                    key="txn_use_recommended",
+        if txn_type in ["buy", "sell"]:
+            c1, c2, c3 = st.columns([1, 1, 1])
+            with c1:
+                t_ticker = st.text_input("Ticker", value=st.session_state["txn_ticker"], key="txn_ticker")
+            with c2:
+                t_shares = st.number_input(
+                    "Shares",
+                    min_value=0.0,
+                    value=float(st.session_state["txn_shares"]),
+                    step=0.001,
+                    format="%.3f",
+                    key="txn_shares",
                 )
 
-                # If user toggles checkbox OFF->ON, re-sync and allow overwrite again
-                if (not st.session_state["txn_use_recommended_prev"]) and use_rec:
-                    st.session_state["txn_price_overridden"] = False
-                    if rec is not None:
-                        st.session_state["txn_price"] = float(rec)
+            rec = fetch_recommended_close(t_ticker, t_date)
+            use_rec = st.checkbox(
+                "Use recommended close price",
+                value=bool(st.session_state["txn_use_recommended"]),
+                key="txn_use_recommended",
+            )
 
-                # Auto-sync only when enabled and not manually overridden
-                if use_rec and (not st.session_state["txn_price_overridden"]) and rec is not None:
+            # seed price if missing
+            if "txn_price" not in st.session_state:
+                st.session_state["txn_price"] = float(rec) if rec is not None else 100.00
+
+            # If checkbox is ON and user hasn't overridden, keep synced
+            if use_rec and (not st.session_state["txn_price_overridden"]) and rec is not None:
+                st.session_state["txn_price"] = float(rec)
+
+            with c3:
+                prev = float(st.session_state["txn_price"])
+                t_price = st.number_input(
+                    "Price",
+                    min_value=0.0,
+                    value=prev,
+                    step=0.01,
+                    format="%.2f",
+                    key="txn_price",
+                )
+
+            # manual override detection (no callbacks)
+            if float(t_price) != float(prev):
+                st.session_state["txn_price_overridden"] = True
+
+            # nice touch: if user toggles OFF -> ON, resync & clear override
+            if (not bool(st.session_state["txn_use_recommended_prev"])) and bool(use_rec):
+                st.session_state["txn_price_overridden"] = False
+                if rec is not None:
                     st.session_state["txn_price"] = float(rec)
+            st.session_state["txn_use_recommended_prev"] = bool(use_rec)
 
-                with c3:
-                    if "txn_price" not in st.session_state:
-                        st.session_state["txn_price"] = float(rec) if rec is not None else 100.00
-
-                    t_price = st.number_input(
-                        "Price",
-                        min_value=0.0,
-                        value=float(st.session_state["txn_price"]),
-                        step=0.01,
-                        format="%.2f",
-                        key="txn_price",
-                        on_change=_mark_price_overridden,
-                    )
-
-                if rec is None:
-                    st.caption("Could not fetch a recommended close price for this ticker/date.")
-                else:
-                    st.caption(f"Recommended: {t_ticker.upper()} close ≈ ${rec:,.2f} (auto-adjusted). Edit anytime.")
-
-                t_amount = np.nan
-
-                # track checkbox state across reruns
-                st.session_state["txn_use_recommended_prev"] = bool(use_rec)
-
+            if rec is None:
+                st.caption("Could not fetch a recommended close price for this ticker/date.")
             else:
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    t_ticker = st.text_input("Ticker (optional)", value="")
-                with c2:
-                    t_amount = st.number_input(
-                        "Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f"
-                    )
-                t_shares = np.nan
-                t_price = np.nan
+                st.caption(f"Recommended: {t_ticker.upper()} close ≈ ${rec:,.2f} (adjusted). Edit anytime.")
 
-            add_txn = st.form_submit_button("Save transaction")
+            t_amount = np.nan
+
+        else:
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                t_ticker_div = st.text_input("Ticker (optional)", value="", key="txn_ticker_div")
+            with c2:
+                t_amount = st.number_input(
+                    "Dividend amount ($)",
+                    min_value=0.0,
+                    value=float(st.session_state["txn_amount"]),
+                    step=1.0,
+                    format="%.2f",
+                    key="txn_amount",
+                )
+            t_ticker = t_ticker_div
+            t_shares = np.nan
+            t_price = np.nan
+
+        add_txn = st.button("Save transaction")
 
         if add_txn:
             row = {
@@ -1251,7 +1257,7 @@ if is_admin:
                 "type": txn_type,
                 "ticker": _clean_str(t_ticker).upper(),
                 "shares": float(round(t_shares, 3)) if pd.notna(t_shares) else np.nan,
-                "price": float(t_price) if pd.notna(t_price) else np.nan,
+                "price": float(st.session_state["txn_price"]) if (txn_type in ["buy", "sell"]) else np.nan,
                 "amount": float(t_amount) if pd.notna(t_amount) else np.nan,
             }
 
@@ -1266,7 +1272,7 @@ if is_admin:
                 txns_all = candidate_txns
                 save_txns(txns_all)
 
-                # ✅ nice touch: reset override so next entry re-autofills cleanly
+                # nice touch: reset override for next entry
                 st.session_state["txn_price_overridden"] = False
 
                 st.success("Saved.")
@@ -1461,7 +1467,7 @@ if is_admin:
         )
 
     # =========================
-    # Backup download (BOTTOM of Admin section)
+    # Backup download
     # =========================
     st.divider()
     st.subheader("Backup")
