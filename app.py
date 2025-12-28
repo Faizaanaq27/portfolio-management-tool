@@ -326,10 +326,11 @@ def recommend_close_on_or_before(ticker: str, d: pd.Timestamp) -> tuple[float | 
     else:
         s = px["Close"].copy()
 
-   idx = pd.to_datetime(s.index, errors="coerce")
-if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
-    idx = idx.tz_convert(None)
-s.index = pd.DatetimeIndex(idx).normalize()
+    # --- critical: ensure tz-naive, normalized index ---
+    idx = pd.to_datetime(s.index, errors="coerce")
+    if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+        idx = idx.tz_convert(None)
+    s.index = pd.DatetimeIndex(idx).normalize()
 
     s = s.dropna()
     s = s[s.index <= d]
@@ -338,6 +339,7 @@ s.index = pd.DatetimeIndex(idx).normalize()
 
     last_dt = s.index[-1]
     return float(s.loc[last_dt]), pd.to_datetime(last_dt)
+
 
 
 @st.cache_data(ttl=86400)
