@@ -1293,162 +1293,194 @@ if is_admin:
     admin_tabs = st.tabs(["Transactions", "Portfolio Settings", "Baseline lots", "Documentation"])
 
     # -----------------------
-    # Transactions tab
-    # -----------------------
-    with admin_tabs[0]:
-        st.subheader("Transactions")
+# Transactions tab
+# -----------------------
+with admin_tabs[0]:
+    st.subheader("Transactions")
 
-        with st.form("add_txn_form", clear_on_submit=False):
-            txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0)
-            t_date = st.date_input("Date", value=date.today())
+    # --- keys for the refresh workflow (do NOT write to the widget key after it renders)
+    price_key = f"txn_price__{active}"
+    ticker_key = f"txn_ticker__{active}"
+    shares_key = f"txn_shares__{active}"
+    use_rec_key = f"use_recommended_price__{active}"
 
-            # NOTE: two submit buttons in the same form
-            refresh_pressed = False
-            add_txn = False
+    refresh_flag_key = f"refresh_price_flag__{active}"
+    refresh_value_key = f"refresh_price_value__{active}"
+    refresh_date_key = f"refresh_price_date__{active}"
+    refresh_ticker_key = f"refresh_price_ticker__{active}"
 
-            if txn_type in ["buy", "sell"]:
-                c1, c2, c3 = st.columns([1, 1, 1])
-                with c1:
-                    t_ticker = st.text_input("Ticker", value="AAPL", key=f"txn_ticker__{active}")
-                with c2:
-                    t_shares = st.number_input(
-                        "Shares", min_value=0.0, value=1.000, step=0.001, format="%.3f", key=f"txn_shares__{active}"
-                    )
+    # If a refresh was requested on the previous run, apply it BEFORE rendering the widget
+    if st.session_state.get(refresh_flag_key, False):
+        v = st.session_state.get(refresh_value_key, None)
+        if v is not None:
+            st.session_state[price_key] = float(v)
+        st.session_state[refresh_flag_key] = False  # clear
 
-                t_amount = np.nan
+    with st.form("add_txn_form", clear_on_submit=False):
+        txn_type = st.selectbox("Type", ["buy", "sell", "dividend"], index=0)
+        t_date = st.date_input("Date", value=date.today())
 
-                tkr_clean = _clean_str(t_ticker).upper()
-                chosen_date = t_date
+        refresh_pressed = False
+        add_txn = False
 
-                rec_key = f"use_recommended_price__{active}"
-                if rec_key not in st.session_state:
-                    st.session_state[rec_key] = True
-                st.checkbox("Use recommended close price", key=rec_key)
+        if txn_type in ["buy", "sell"]:
+            c1, c2, c3 = st.columns([1, 1, 1])
 
-                rec = fetch_close_on_or_before(tkr_clean, chosen_date) if tkr_clean else None
-                price_key = f"txn_price__{active}"
+            with c1:
+                t_ticker = st.text_input("Ticker", value="AAPL", key=ticker_key)
+            with c2:
+                t_shares = st.number_input(
+                    "Shares",
+                    min_value=0.0,
+                    value=1.000,
+                    step=0.001,
+                    format="%.3f",
+                    key=shares_key,
+                )
 
-                # seed if not present
-                if price_key not in st.session_state:
-                    st.session_state[price_key] = float(rec) if (st.session_state[rec_key] and rec is not None) else 100.00
-                else:
-                    # if toggle is ON, keep price synced to rec when ticker/date changes
-                    # (simple approach: overwrite whenever rec exists and toggle on)
-                    if st.session_state[rec_key] and rec is not None:
-                        st.session_state[price_key] = float(rec)
+            t_amount = np.nan
 
-                with c3:
-                    t_price = st.number_input(
-                        "Price",
-                        min_value=0.0,
-                        value=float(st.session_state[price_key]),
-                        step=0.01,
-                        format="%.2f",
-                        key=price_key,
-                        help="Auto-fills with close on/before the transaction date (editable).",
-                    )
-                    refresh_pressed = st.form_submit_button("🔄 Refresh price")
-
-                if rec is not None and tkr_clean:
-                    st.caption(f"Recommended close for {tkr_clean} on/before {chosen_date.isoformat()}: **${rec:,.2f}**")
-
-            else:
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    t_ticker = st.text_input("Ticker (optional)", value="")
-                with c2:
-                    t_amount = st.number_input("Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
-                t_shares = np.nan
-                t_price = np.nan
-
-            add_txn = st.form_submit_button("Save transaction")
-
-        # handle refresh (outside the form block)
-        if refresh_pressed:
-            tkr_clean = _clean_str(st.session_state.get(f"txn_ticker__{active}", "")).upper()
+            # Recommended close
+            tkr_clean = str(st.session_state.get(ticker_key, "")).upper().strip()
             chosen_date = t_date
-            price_key = f"txn_price__{active}"
-            if not tkr_clean:
-                st.warning("Enter a ticker first.")
+
+            if use_rec_key not in st.session_state:
+                st.session_state[use_rec_key] = True
+
+            st.checkbox("Use recommended close price", key=use_rec_key)
+
+            rec = fetch_close_on_or_before(tkr_clean, chosen_date) if tkr_clean else None
+
+            # Initialize widget value once (or keep prior)
+            if price_key not in st.session_state:
+                st.session_state[price_key] = float(rec) if (st.session_state[use_rec_key] and rec is not None) else 100.00
+
+            # If toggle is ON, sync to rec (only by setting before widget renders — safe here)
+            if st.session_state[use_rec_key] and rec is not None:
+                st.session_state[price_key] = float(rec)
+
+            with c3:
+                t_price = st.number_input(
+                    "Price",
+                    min_value=0.0,
+                    value=float(st.session_state[price_key]),
+                    step=0.01,
+                    format="%.2f",
+                    key=price_key,
+                    help="Auto-fills with close on/before the transaction date (editable).",
+                )
+
+                # This button does NOT directly set price_key.
+                refresh_pressed = st.form_submit_button("🔄 Refresh price")
+
+            if rec is not None and tkr_clean:
+                st.caption(f"Recommended close for {tkr_clean} on/before {chosen_date.isoformat()}: **${rec:,.2f}**")
+
+        else:
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                t_ticker = st.text_input("Ticker (optional)", value="")
+            with c2:
+                t_amount = st.number_input(
+                    "Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f"
+                )
+            t_shares = np.nan
+            t_price = np.nan
+
+        add_txn = st.form_submit_button("Save transaction")
+
+    # --- handle refresh OUTSIDE the form: set a separate key then rerun
+    if refresh_pressed:
+        tkr_clean = str(st.session_state.get(ticker_key, "")).upper().strip()
+        chosen_date = t_date
+
+        if not tkr_clean:
+            st.warning("Enter a ticker first.")
+        else:
+            rec2 = fetch_close_on_or_before(tkr_clean, chosen_date)
+            if rec2 is None:
+                st.error("Could not fetch a close price for that ticker/date.")
             else:
-                rec2 = fetch_close_on_or_before(tkr_clean, chosen_date)
-                if rec2 is None:
-                    st.error("Could not fetch a close price for that ticker/date.")
-                else:
-                    st.session_state[price_key] = float(rec2)
-                    st.success(f"Updated price to ${rec2:,.2f}")
-                    st.rerun()
+                # store under non-widget keys, then rerun
+                st.session_state[refresh_value_key] = float(rec2)
+                st.session_state[refresh_flag_key] = True
+                st.session_state[refresh_date_key] = str(chosen_date)
+                st.session_state[refresh_ticker_key] = tkr_clean
+                st.rerun()
 
-        if add_txn:
-            row = {
-                "txn_id": str(pd.Timestamp.utcnow().value),
-                "portfolio": active,
-                "date": pd.to_datetime(t_date),
-                "type": txn_type,
-                "ticker": _clean_str(t_ticker).upper(),
-                "shares": float(round(t_shares, 3)) if pd.notna(t_shares) else np.nan,
-                "price": float(t_price) if pd.notna(t_price) else np.nan,
-                "amount": float(t_amount) if pd.notna(t_amount) else np.nan,
-            }
+    if add_txn:
+        # Pull latest values from session_state (safer since widgets live there)
+        t_ticker_final = str(st.session_state.get(ticker_key, "")).upper().strip()
 
-            candidate_txns = pd.concat([txns_all, pd.DataFrame([row])], ignore_index=True)
-            p_txns = candidate_txns[candidate_txns["portfolio"] == active].copy()
+        row = {
+            "txn_id": str(pd.Timestamp.utcnow().value),
+            "portfolio": active,
+            "date": pd.to_datetime(t_date),
+            "type": txn_type,
+            "ticker": t_ticker_final,
+            "shares": float(round(float(st.session_state.get(shares_key, np.nan)), 3)) if txn_type in ["buy", "sell"] else np.nan,
+            "price": float(st.session_state.get(price_key, np.nan)) if txn_type in ["buy", "sell"] else np.nan,
+            "amount": float(t_amount) if pd.notna(t_amount) else np.nan,
+        }
+
+        candidate_txns = pd.concat([txns_all, pd.DataFrame([row])], ignore_index=True)
+        p_txns = candidate_txns[candidate_txns["portfolio"] == active].copy()
+        p_base = baseline_all[baseline_all["portfolio"] == active].copy()
+
+        ok, msg = validate_candidate_state(meta, p_txns, p_base, match_method)
+        if not ok:
+            st.error(msg)
+        else:
+            txns_all = candidate_txns
+            save_txns(txns_all)
+            st.success("Saved.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Delete transaction")
+
+    p_txns = txns_all[txns_all["portfolio"] == active].copy()
+    if p_txns.empty:
+        st.info("No transactions.")
+    else:
+        disp = p_txns.copy()
+        disp["date_str"] = pd.to_datetime(disp["date"]).dt.date.astype(str)
+        disp["desc"] = np.where(
+            disp["type"].isin(["buy", "sell"]),
+            disp["date_str"]
+            + " | "
+            + disp["type"]
+            + " | "
+            + disp["ticker"]
+            + " | "
+            + disp["shares"].map(lambda x: f"{x:.3f}")
+            + " @ "
+            + disp["price"].map(lambda x: f"{x:.2f}"),
+            disp["date_str"]
+            + " | dividend | "
+            + disp["ticker"].fillna("").astype(str)
+            + " | $"
+            + disp["amount"].map(lambda x: f"{x:.2f}"),
+        )
+        disp["display"] = disp["desc"] + " | id=" + disp["txn_id"].astype(str)
+
+        choice = st.selectbox("Select transaction", disp["display"].tolist(), key="del_txn_choice")
+        chosen_id = choice.split("id=")[-1].strip()
+
+        if st.button("Delete selected transaction"):
+            candidate_txns = txns_all[txns_all["txn_id"].astype(str) != chosen_id].copy()
+
+            p_txns2 = candidate_txns[candidate_txns["portfolio"] == active].copy()
             p_base = baseline_all[baseline_all["portfolio"] == active].copy()
+            ok, msg = validate_candidate_state(meta, p_txns2, p_base, match_method)
 
-            ok, msg = validate_candidate_state(meta, p_txns, p_base, match_method)
             if not ok:
-                st.error(msg)
+                st.error(f"Delete rejected: {msg}")
             else:
                 txns_all = candidate_txns
                 save_txns(txns_all)
-                st.success("Saved.")
+                st.warning("Deleted.")
                 st.rerun()
-
-        st.divider()
-        st.subheader("Delete transaction")
-
-        p_txns = txns_all[txns_all["portfolio"] == active].copy()
-        if p_txns.empty:
-            st.info("No transactions.")
-        else:
-            disp = p_txns.copy()
-            disp["date_str"] = pd.to_datetime(disp["date"]).dt.date.astype(str)
-            disp["desc"] = np.where(
-                disp["type"].isin(["buy", "sell"]),
-                disp["date_str"]
-                + " | "
-                + disp["type"]
-                + " | "
-                + disp["ticker"]
-                + " | "
-                + disp["shares"].map(lambda x: f"{x:.3f}")
-                + " @ "
-                + disp["price"].map(lambda x: f"{x:.2f}"),
-                disp["date_str"]
-                + " | dividend | "
-                + disp["ticker"].fillna("").astype(str)
-                + " | $"
-                + disp["amount"].map(lambda x: f"{x:.2f}"),
-            )
-            disp["display"] = disp["desc"] + " | id=" + disp["txn_id"].astype(str)
-
-            choice = st.selectbox("Select transaction", disp["display"].tolist(), key="del_txn_choice")
-            chosen_id = choice.split("id=")[-1].strip()
-
-            if st.button("Delete selected transaction"):
-                candidate_txns = txns_all[txns_all["txn_id"].astype(str) != chosen_id].copy()
-
-                p_txns2 = candidate_txns[candidate_txns["portfolio"] == active].copy()
-                p_base = baseline_all[baseline_all["portfolio"] == active].copy()
-                ok, msg = validate_candidate_state(meta, p_txns2, p_base, match_method)
-
-                if not ok:
-                    st.error(f"Delete rejected: {msg}")
-                else:
-                    txns_all = candidate_txns
-                    save_txns(txns_all)
-                    st.warning("Deleted.")
-                    st.rerun()
 
     # -----------------------
     # Portfolio Settings tab
