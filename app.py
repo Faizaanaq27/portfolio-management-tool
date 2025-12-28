@@ -293,12 +293,10 @@ def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) 
         return pd.Series(dtype=float, name=t)
 
     idx = pd.to_datetime(div.index)
-    # tz-safe -> tz-naive
     try:
         if getattr(idx, "tz", None) is not None:
             idx = idx.tz_convert(None)
     except Exception:
-        # sometimes it's tz-localized; try localize(None)
         try:
             idx = idx.tz_localize(None)
         except Exception:
@@ -559,8 +557,31 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 # =========================
 # 4) Chart helpers (WEEKLY/Daily)
 # =========================
-def _portfolio_start_date(meta: dict) -> pd.Timestamp:
-    return pd.to_datetime(meta["as_of_date"]).normalize()
+def portfolio_chart_start_date(
+    pname: str,
+    meta: dict,
+    txns_all: pd.DataFrame,
+) -> pd.Timestamp:
+    """
+    Critical fix:
+    - snapshot_start: start at as_of boundary
+    - ledger_complete: start at earliest txn date (NOT as_of_date, which defaults to today)
+    """
+    start_mode = str(meta.get("start_mode", "ledger_complete")).lower()
+    as_of = pd.to_datetime(meta.get("as_of_date", pd.to_datetime(date.today()))).normalize()
+
+    if start_mode == "snapshot_start":
+        return as_of
+
+    # ledger_complete
+    tx = txns_all[txns_all["portfolio"] == pname].copy()
+    if tx.empty:
+        return as_of
+    tx["date"] = pd.to_datetime(tx["date"], errors="coerce").dt.normalize()
+    tx = tx.dropna(subset=["date"])
+    if tx.empty:
+        return as_of
+    return tx["date"].min().normalize()
 
 
 def index_to_100(series: pd.Series) -> pd.Series:
@@ -582,7 +603,7 @@ def compute_nav_series_for_portfolio(
     end_date: pd.Timestamp,
     chart_freq: str,  # "D" or "W-MON"
 ) -> pd.Series:
-    start = _portfolio_start_date(meta)
+    start = portfolio_chart_start_date(pname, meta, txns_all)
     end = pd.to_datetime(end_date).normalize()
 
     txns = txns_all[txns_all["portfolio"] == pname].copy()
@@ -830,10 +851,7 @@ def compute_daily_shares_df(
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """
-    Daily shares outstanding by ticker from start boundary to end_date.
-    """
-    start = _portfolio_start_date(meta)
+    start = portfolio_chart_start_date(pname, meta, txns_all)  # aligns dividend window with chart window
     end = pd.to_datetime(end_date).normalize()
     idx = pd.date_range(start=start, end=end, freq="D")
     if len(idx) == 0:
@@ -888,11 +906,7 @@ def compute_dividend_accrual_quarterly(
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
 ) -> dict:
-    """
-    Uses yfinance dividend-per-share events and multiplies by shares held on that date.
-    Groups cash dividends into quarter-ends.
-    """
-    start = _portfolio_start_date(meta)
+    start = portfolio_chart_start_date(pname, meta, txns_all)
     end = pd.to_datetime(end_date).normalize()
 
     shares_df = compute_daily_shares_df(pname, meta, txns_all, baseline_all, end)
@@ -1010,7 +1024,6 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     d1.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
     d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
 
-    # Dividend accrual (computed dividends, not necessarily entered as txns)
     divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(date.today()))
     st.metric("Dividends (estimated, quarterly accrual)", f"${float(divpack['total']):,.2f}")
 
@@ -1250,9 +1263,6 @@ if is_admin:
     st.markdown("---")
     st.header("Admin")
 
-    # =========================
-    # Create portfolio (TOP)
-    # =========================
     st.subheader("Create portfolio")
     with st.form("create_portfolio_form", clear_on_submit=True):
         new_name = st.text_input("Name", placeholder="e.g., Long Only, Trading, IRA")
@@ -1290,15 +1300,9 @@ if is_admin:
 
     st.divider()
 
-    # =========================
-    # Active portfolio selector
-    # =========================
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
-    # =========================
-    # Tabs
-    # =========================
     admin_tabs = st.tabs(["Transactions", "Portfolio Settings", "Baseline lots", "Documentation"])
 
     # -----------------------
@@ -1307,7 +1311,6 @@ if is_admin:
     with admin_tabs[0]:
         st.subheader("Transactions")
 
-        # --- keys for the refresh workflow (do NOT write to the widget key after it renders)
         price_key = f"txn_price__{active}"
         ticker_key = f"txn_ticker__{active}"
         shares_key = f"txn_shares__{active}"
@@ -1316,12 +1319,11 @@ if is_admin:
         refresh_flag_key = f"refresh_price_flag__{active}"
         refresh_value_key = f"refresh_price_value__{active}"
 
-        # If a refresh was requested on the previous run, apply it BEFORE rendering the widget
         if st.session_state.get(refresh_flag_key, False):
             v = st.session_state.get(refresh_value_key, None)
             if v is not None:
                 st.session_state[price_key] = float(v)
-            st.session_state[refresh_flag_key] = False  # clear
+            st.session_state[refresh_flag_key] = False
 
         refresh_pressed = False
         add_txn = False
@@ -1356,11 +1358,9 @@ if is_admin:
 
                 rec = fetch_close_on_or_before(tkr_clean, chosen_date) if tkr_clean else None
 
-                # init price once
                 if price_key not in st.session_state:
                     st.session_state[price_key] = float(rec) if (st.session_state[use_rec_key] and rec is not None) else 100.00
 
-                # if toggle ON, sync to rec BEFORE widget renders (safe)
                 if st.session_state[use_rec_key] and rec is not None:
                     st.session_state[price_key] = float(rec)
 
@@ -1390,7 +1390,6 @@ if is_admin:
 
             add_txn = st.form_submit_button("Save transaction")
 
-        # Handle refresh OUTSIDE the form: set a separate key then rerun
         if refresh_pressed:
             tkr_clean = str(st.session_state.get(ticker_key, "")).upper().strip()
             chosen_date = t_date
@@ -1610,9 +1609,6 @@ if is_admin:
 """
         )
 
-    # =========================
-    # Backup download
-    # =========================
     st.divider()
     st.subheader("Backup")
     st.caption("Download a ZIP containing: portfolios.csv, transactions.csv, baseline_lots.csv")
