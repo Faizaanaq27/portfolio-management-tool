@@ -338,16 +338,52 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 
 
 # =========================
-# 2d) Bulk upload helpers (CSV: TICKER | TRANSACTION TYPE | DATE | SHARE COUNT)
+# 2d) Bulk upload helpers
+# CSV: TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE (optional)
 # =========================
+def _parse_shares_upload(x):
+    """
+    Accepts:
+      10
+      "10"
+      "1,000"
+      "(30)"  -> treated as 30 (we take abs; direction comes from type)
+    """
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    neg_paren = s.startswith("(") and s.endswith(")")
+    s = s.replace("(", "").replace(")", "").replace(",", "").strip()
+    try:
+        v = float(s)
+    except Exception:
+        return np.nan
+    if neg_paren:
+        v = -v
+    return abs(v)
+
+
+def _norm_type(x: str) -> str:
+    s = str(x).lower().strip()
+    mapping = {
+        "buy to cover": "cover",
+        "buy-to-cover": "cover",
+        "cover short": "cover",
+        "sell short": "short",
+        "short sell": "short",
+    }
+    return mapping.get(s, s)
+
+
 def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
     """
-    Expected columns:
-      TICKER | TRANSACTION TYPE | DATE | SHARE COUNT
+    Expected headers:
+      TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE (optional)
 
     Returns normalized df:
-      ticker, type, date, shares
+      ticker, type, date, shares, price
     Only keeps type in {buy, sell, short, cover}.
+    PRICE can be NaN (we can fetch it later).
     """
     df = pd.read_csv(uploaded_file)
     df.columns = [str(c).strip().upper() for c in df.columns]
@@ -359,9 +395,15 @@ def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
 
     out = pd.DataFrame()
     out["ticker"] = df["TICKER"].astype(str).str.upper().str.strip()
-    out["type"] = df["TRANSACTION TYPE"].astype(str).str.lower().str.strip()
+    out["type"] = df["TRANSACTION TYPE"].apply(_norm_type)
     out["date"] = pd.to_datetime(df["DATE"], errors="coerce").dt.normalize()
-    out["shares"] = pd.to_numeric(df["SHARE COUNT"], errors="coerce").abs()
+    out["shares"] = df["SHARE COUNT"].apply(_parse_shares_upload)
+
+    if "PRICE" in df.columns:
+        out["price"] = pd.to_numeric(df["PRICE"], errors="coerce")
+        out.loc[out["price"] < 0, "price"] = np.nan
+    else:
+        out["price"] = np.nan
 
     out = out[out["type"].isin(["buy", "sell", "short", "cover"])].copy()
     out = out.dropna(subset=["ticker", "type", "date", "shares"])
@@ -369,12 +411,18 @@ def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def enrich_import_with_prices(import_df: pd.DataFrame, prefer_uploaded: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Adds a price column via fetch_close_on_or_before(ticker, date).
-    Returns: (good_df, bad_df)
+    Ensures there is a valid price for each row.
+    If prefer_uploaded is True:
+      - keep uploaded price when present
+      - fetch price only where price is missing/invalid
+    If prefer_uploaded is False:
+      - ignore uploaded price and fetch for all rows
+
+    Returns: (good_df, bad_df) where bad_df has a reason.
     """
-    if import_df.empty:
+    if import_df is None or import_df.empty:
         return import_df, pd.DataFrame()
 
     rows = []
@@ -383,10 +431,18 @@ def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd
     for _, r in import_df.iterrows():
         t = str(r["ticker"]).upper().strip()
         d = pd.to_datetime(r["date"]).date()
-        px = fetch_close_on_or_before(t, d)
 
-        if px is None or (not np.isfinite(px)):
-            failed.append({**r.to_dict(), "reason": "Could not fetch close on/before date"})
+        uploaded_px = r.get("price", np.nan)
+        uploaded_px = float(uploaded_px) if pd.notna(uploaded_px) else np.nan
+
+        px = np.nan
+        if prefer_uploaded and np.isfinite(uploaded_px) and uploaded_px >= 0:
+            px = uploaded_px
+        else:
+            px = fetch_close_on_or_before(t, d)
+
+        if px is None or (not np.isfinite(px)) or px < 0:
+            failed.append({**r.to_dict(), "reason": "Could not determine price (uploaded missing/invalid and Yahoo fetch failed)"})
             continue
 
         rows.append({**r.to_dict(), "price": float(px)})
@@ -1642,12 +1698,20 @@ if is_admin:
                 st.rerun()
 
         # -----------------------
-        # Bulk upload (beneath Add transaction)
+        # Bulk upload (beneath Add transaction)  ✅ UPDATED: supports PRICE column
         # -----------------------
         st.divider()
         st.subheader("Bulk upload (CSV)")
 
-        st.caption("CSV columns must be exactly: **TICKER | TRANSACTION TYPE | DATE | SHARE COUNT**. Only buy/sell/short/cover are imported.")
+        prefer_price_key = f"bulk_prefer_uploaded_price__{active}"
+        if prefer_price_key not in st.session_state:
+            st.session_state[prefer_price_key] = True
+
+        st.caption(
+            "CSV headers: **TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE** (PRICE optional). "
+            "Only buy/sell/short/cover are imported."
+        )
+
         up = st.file_uploader(
             "Upload transactions CSV ❓",
             type=["csv"],
@@ -1655,32 +1719,30 @@ if is_admin:
             help="""
 Required CSV format (headers required):
 
-TICKER | TRANSACTION TYPE | DATE | SHARE COUNT
+TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE
 
-• TICKER
-  - Stock ticker (e.g., AAPL, SPY)
-  - Case-insensitive (will be uppercased)
+• PRICE is optional:
+  - If provided, it will be used (when 'Prefer uploaded PRICE' is ON)
+  - If blank/invalid, the app fetches Yahoo close on/before DATE
 
-• TRANSACTION TYPE
-  - Must be one of:
-    buy, sell, short, cover
-  - Anything else (dividend, cash, fees, etc.) is ignored
+• TRANSACTION TYPE must be one of:
+  buy, sell, short, cover
+(Other types are ignored)
 
-• DATE
-  - Any standard date format (YYYY-MM-DD recommended)
-
-• SHARE COUNT
-  - Must be a positive number
-  - Parentheses for negatives are allowed (e.g. (30))
-  - Direction is inferred from TRANSACTION TYPE
+• SHARE COUNT must be positive.
+  Parentheses allowed (e.g., (30)).
 
 Notes:
-• Prices are automatically filled using Yahoo Finance
-  (close on or before the transaction date)
-• Shorts increase cash; covers decrease cash
-• Import can Append or Replace the selected portfolio
-• Invalid rows are skipped and shown before import
-"""
+• Import can Append or Replace the selected portfolio.
+• Invalid rows are skipped and shown before import.
+""",
+        )
+
+        st.checkbox(
+            "Prefer uploaded PRICE when provided",
+            value=bool(st.session_state[prefer_price_key]),
+            key=prefer_price_key,
+            help="If unchecked, uploaded PRICE is ignored and Yahoo close is used for ALL rows.",
         )
 
         mode = st.radio(
@@ -1698,18 +1760,23 @@ Notes:
             try:
                 raw_import = parse_simple_txn_csv(up)
                 st.session_state[preview_key_raw] = raw_import
+                # clear old previews if a new file is uploaded
+                st.session_state.pop(preview_key_good, None)
+                st.session_state.pop(preview_key_bad, None)
             except Exception as e:
                 st.error(f"Upload failed: {e}")
                 st.session_state[preview_key_raw] = pd.DataFrame()
+                st.session_state.pop(preview_key_good, None)
+                st.session_state.pop(preview_key_bad, None)
 
         raw_import = st.session_state.get(preview_key_raw, pd.DataFrame())
 
         if isinstance(raw_import, pd.DataFrame) and not raw_import.empty:
-            st.write("Parsed rows (pre-price):")
+            st.write("Parsed rows (raw):")
             st.dataframe(raw_import, use_container_width=True)
 
             if st.button("Preview with prices", key=f"bulk_preview_btn__{active}"):
-                good, bad = enrich_import_with_prices(raw_import)
+                good, bad = enrich_import_with_prices(raw_import, prefer_uploaded=bool(st.session_state[prefer_price_key]))
                 st.session_state[preview_key_good] = good
                 st.session_state[preview_key_bad] = bad
                 st.rerun()
@@ -1718,15 +1785,14 @@ Notes:
         bad = st.session_state.get(preview_key_bad, pd.DataFrame())
 
         if isinstance(bad, pd.DataFrame) and not bad.empty:
-            st.warning(f"Skipped: {len(bad)} rows (could not fetch price).")
+            st.warning(f"Skipped: {len(bad)} rows (price missing and could not fetch).")
             st.dataframe(bad, use_container_width=True)
 
         if isinstance(good, pd.DataFrame) and not good.empty:
-            st.success(f"Ready to import: {len(good)} rows (prices found).")
+            st.success(f"Ready to import: {len(good)} rows (prices resolved).")
             st.dataframe(good, use_container_width=True)
 
             if st.button("✅ Import into portfolio", type="primary", key=f"bulk_import_btn__{active}"):
-                # Build app-schema rows
                 rows = []
                 base_id = pd.Timestamp.utcnow().value
                 for i, r in good.reset_index(drop=True).iterrows():
@@ -1762,7 +1828,6 @@ Notes:
                     save_txns(txns_all)
                     st.success(f"Imported {len(imported_df)} transactions into '{active}' ({mode}).")
 
-                    # clear preview state so you don't accidentally double-import
                     st.session_state.pop(preview_key_good, None)
                     st.session_state.pop(preview_key_bad, None)
                     st.session_state.pop(preview_key_raw, None)
@@ -1947,6 +2012,17 @@ Notes:
    - Entry / cost basis price
    - Acquisition date
 5. Enter only **new** transactions after the as-of date in **Transactions**
+
+### CSV bulk upload format
+
+Headers:
+
+**TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE**
+
+- **PRICE is optional**
+  - If provided and “Prefer uploaded PRICE” is ON, we use it.
+  - If missing/invalid, we auto-fill from Yahoo close on/before DATE.
+  - If “Prefer uploaded PRICE” is OFF, we ignore uploaded prices and fetch for all rows.
 
 ### Shorting
 
