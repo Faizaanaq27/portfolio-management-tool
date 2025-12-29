@@ -338,52 +338,44 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 
 
 # =========================
-# 2d) Bulk upload helpers
-# CSV: TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE (optional)
+# 2d) Bulk upload helpers (CSV)
 # =========================
-def _parse_shares_upload(x):
+def _parse_number_allow_parens(x):
     """
-    Accepts:
-      10
-      "10"
-      "1,000"
-      "(30)"  -> treated as 30 (we take abs; direction comes from type)
+    Accepts numbers like:
+      10, -10, (10), "  (10)  "
+    Returns float or np.nan.
     """
-    if pd.isna(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
     s = str(x).strip()
-    neg_paren = s.startswith("(") and s.endswith(")")
-    s = s.replace("(", "").replace(")", "").replace(",", "").strip()
+    if s == "":
+        return np.nan
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1].strip()
+    s = s.replace(",", "")
     try:
         v = float(s)
+        if neg:
+            v = -v
+        return v
     except Exception:
         return np.nan
-    if neg_paren:
-        v = -v
-    return abs(v)
-
-
-def _norm_type(x: str) -> str:
-    s = str(x).lower().strip()
-    mapping = {
-        "buy to cover": "cover",
-        "buy-to-cover": "cover",
-        "cover short": "cover",
-        "sell short": "short",
-        "short sell": "short",
-    }
-    return mapping.get(s, s)
 
 
 def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
     """
-    Expected headers:
-      TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE (optional)
+    Required columns:
+      TICKER | TRANSACTION TYPE | DATE | SHARE COUNT
+
+    Optional columns:
+      PRICE   (if omitted/blank => filled from Yahoo close-on-or-before date)
 
     Returns normalized df:
       ticker, type, date, shares, price
     Only keeps type in {buy, sell, short, cover}.
-    PRICE can be NaN (we can fetch it later).
     """
     df = pd.read_csv(uploaded_file)
     df.columns = [str(c).strip().upper() for c in df.columns]
@@ -395,12 +387,14 @@ def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
 
     out = pd.DataFrame()
     out["ticker"] = df["TICKER"].astype(str).str.upper().str.strip()
-    out["type"] = df["TRANSACTION TYPE"].apply(_norm_type)
+    out["type"] = df["TRANSACTION TYPE"].astype(str).str.lower().str.strip()
     out["date"] = pd.to_datetime(df["DATE"], errors="coerce").dt.normalize()
-    out["shares"] = df["SHARE COUNT"].apply(_parse_shares_upload)
+
+    shares_raw = df["SHARE COUNT"].apply(_parse_number_allow_parens)
+    out["shares"] = pd.to_numeric(shares_raw, errors="coerce").abs()
 
     if "PRICE" in df.columns:
-        out["price"] = pd.to_numeric(df["PRICE"], errors="coerce")
+        out["price"] = pd.to_numeric(df["PRICE"].apply(_parse_number_allow_parens), errors="coerce")
         out.loc[out["price"] < 0, "price"] = np.nan
     else:
         out["price"] = np.nan
@@ -411,16 +405,13 @@ def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def enrich_import_with_prices(import_df: pd.DataFrame, prefer_uploaded: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
+def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Ensures there is a valid price for each row.
-    If prefer_uploaded is True:
-      - keep uploaded price when present
-      - fetch price only where price is missing/invalid
-    If prefer_uploaded is False:
-      - ignore uploaded price and fetch for all rows
+    Ensures there is a valid 'price' for every row.
+    - If import_df has a non-null price, we keep it.
+    - Otherwise we fetch close-on-or-before (ticker, date).
 
-    Returns: (good_df, bad_df) where bad_df has a reason.
+    Returns: (good_df, bad_df)
     """
     if import_df is None or import_df.empty:
         return import_df, pd.DataFrame()
@@ -429,20 +420,23 @@ def enrich_import_with_prices(import_df: pd.DataFrame, prefer_uploaded: bool) ->
     failed = []
 
     for _, r in import_df.iterrows():
-        t = str(r["ticker"]).upper().strip()
-        d = pd.to_datetime(r["date"]).date()
+        t = str(r.get("ticker", "")).upper().strip()
+        d = pd.to_datetime(r.get("date")).date() if pd.notna(r.get("date")) else None
+        sh = float(r.get("shares", np.nan)) if pd.notna(r.get("shares")) else np.nan
+        typ = str(r.get("type", "")).lower().strip()
 
-        uploaded_px = r.get("price", np.nan)
-        uploaded_px = float(uploaded_px) if pd.notna(uploaded_px) else np.nan
+        if not t or d is None or not np.isfinite(sh) or sh <= 0 or typ not in ["buy", "sell", "short", "cover"]:
+            failed.append({**r.to_dict(), "reason": "Invalid ticker/date/shares/type"})
+            continue
 
-        px = np.nan
-        if prefer_uploaded and np.isfinite(uploaded_px) and uploaded_px >= 0:
-            px = uploaded_px
-        else:
-            px = fetch_close_on_or_before(t, d)
+        px_in = r.get("price", np.nan)
+        if pd.notna(px_in) and np.isfinite(float(px_in)) and float(px_in) >= 0:
+            rows.append({**r.to_dict(), "price": float(px_in)})
+            continue
 
-        if px is None or (not np.isfinite(px)) or px < 0:
-            failed.append({**r.to_dict(), "reason": "Could not determine price (uploaded missing/invalid and Yahoo fetch failed)"})
+        px = fetch_close_on_or_before(t, d)
+        if px is None or (not np.isfinite(px)):
+            failed.append({**r.to_dict(), "reason": "Could not fetch close on/before date"})
             continue
 
         rows.append({**r.to_dict(), "price": float(px)})
@@ -493,6 +487,8 @@ def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, si
             lot["shares_open"] = sh_open + take
             remaining -= take
             realized_rows.append((lot, take))
+
+        i += 1
 
     return realized_rows, remaining
 
@@ -718,7 +714,11 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 
     cash_now = starting_cash + (df.apply(cash_delta, axis=1).sum() if not df.empty else 0.0)
 
-    trades = df[df["type"].isin(["buy", "sell", "short", "cover"])].copy() if not df.empty else pd.DataFrame(columns=TXN_COLS)
+    trades = (
+        df[df["type"].isin(["buy", "sell", "short", "cover"])].copy()
+        if not df.empty
+        else pd.DataFrame(columns=TXN_COLS)
+    )
     open_lots, realized = build_lots_with_baseline(trades, baseline, method)
 
     if not open_lots.empty:
@@ -750,7 +750,9 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
             unrealized_pnl=("unrealized_pnl", "sum"),
         )
         holdings["position"] = np.where(holdings["shares"] >= 0, "LONG", "SHORT")
-        holdings["avg_cost"] = np.where(holdings["abs_shares"] > 0, holdings["cost_dollars"] / holdings["abs_shares"], np.nan)
+        holdings["avg_cost"] = np.where(
+            holdings["abs_shares"] > 0, holdings["cost_dollars"] / holdings["abs_shares"], np.nan
+        )
         holdings = holdings.sort_values("market_value", ascending=False)
     else:
         lots_view = open_lots
@@ -846,7 +848,11 @@ def compute_nav_series_for_portfolio(
             t = str(r["ticker"]).upper().strip()
             baseline_shares[t] = baseline_shares.get(t, 0.0) + float(r["shares_open"])
 
-    trades = txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
+    trades = (
+        txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy()
+        if not txns.empty
+        else pd.DataFrame(columns=TXN_COLS)
+    )
     tickers = set(baseline_shares.keys())
 
     if not trades.empty:
@@ -1003,9 +1009,7 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df["industry"] = df["industry"].fillna("Unknown")
 
     sector_alloc = (
-        df.groupby(["sector"], as_index=False)
-        .agg(exposure=("exposure", "sum"))
-        .sort_values("exposure", ascending=False)
+        df.groupby(["sector"], as_index=False).agg(exposure=("exposure", "sum")).sort_values("exposure", ascending=False)
     )
     sector_total = float(sector_alloc["exposure"].sum())
     sector_alloc["weight"] = np.where(sector_total > 0, sector_alloc["exposure"] / sector_total, 0.0)
@@ -1094,7 +1098,11 @@ def compute_daily_shares_df(
             t = str(r["ticker"]).upper().strip()
             baseline_shares[t] = baseline_shares.get(t, 0.0) + float(r["shares_open"])
 
-    trades = txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy() if not txns.empty else pd.DataFrame(columns=TXN_COLS)
+    trades = (
+        txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy()
+        if not txns.empty
+        else pd.DataFrame(columns=TXN_COLS)
+    )
     tickers = set(baseline_shares.keys())
     if not trades.empty:
         trades["ticker"] = trades["ticker"].astype(str).str.upper().str.strip()
@@ -1698,51 +1706,33 @@ if is_admin:
                 st.rerun()
 
         # -----------------------
-        # Bulk upload (beneath Add transaction)  ✅ UPDATED: supports PRICE column
+        # Bulk upload (beneath Add transaction)
         # -----------------------
         st.divider()
         st.subheader("Bulk upload (CSV)")
-
-        prefer_price_key = f"bulk_prefer_uploaded_price__{active}"
-        if prefer_price_key not in st.session_state:
-            st.session_state[prefer_price_key] = True
-
-        st.caption(
-            "CSV headers: **TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE** (PRICE optional). "
-            "Only buy/sell/short/cover are imported."
-        )
 
         up = st.file_uploader(
             "Upload transactions CSV ❓",
             type=["csv"],
             key=f"bulk_upload_csv__{active}",
             help="""
-Required CSV format (headers required):
+Required CSV headers (exact):
 
-TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE
+TICKER | TRANSACTION TYPE | DATE | SHARE COUNT
 
-• PRICE is optional:
-  - If provided, it will be used (when 'Prefer uploaded PRICE' is ON)
-  - If blank/invalid, the app fetches Yahoo close on/before DATE
+Optional:
+PRICE
 
-• TRANSACTION TYPE must be one of:
-  buy, sell, short, cover
-(Other types are ignored)
-
-• SHARE COUNT must be positive.
-  Parentheses allowed (e.g., (30)).
+• TICKER: AAPL, SPY (upper/lower ok)
+• TRANSACTION TYPE: buy, sell, short, cover (anything else ignored)
+• DATE: YYYY-MM-DD recommended
+• SHARE COUNT: positive number (parentheses allowed, e.g. (30))
+• PRICE (optional): if blank/missing, the app will fetch Yahoo close on/before DATE
 
 Notes:
-• Import can Append or Replace the selected portfolio.
-• Invalid rows are skipped and shown before import.
+• Import can Append or Replace the selected portfolio
+• Invalid rows are skipped and shown
 """,
-        )
-
-        st.checkbox(
-            "Prefer uploaded PRICE when provided",
-            value=bool(st.session_state[prefer_price_key]),
-            key=prefer_price_key,
-            help="If unchecked, uploaded PRICE is ignored and Yahoo close is used for ALL rows.",
         )
 
         mode = st.radio(
@@ -1755,28 +1745,38 @@ Notes:
         preview_key_good = f"bulk_good__{active}"
         preview_key_bad = f"bulk_bad__{active}"
         preview_key_raw = f"bulk_raw__{active}"
+        file_sig_key = f"bulk_file_sig__{active}"
 
+        def _file_signature(f) -> str:
+            name = getattr(f, "name", "unknown")
+            size = getattr(f, "size", "unknown")
+            return f"{name}::{size}"
+
+        # IMPORTANT: only re-parse + clear previews when the file changes
         if up is not None:
-            try:
-                raw_import = parse_simple_txn_csv(up)
-                st.session_state[preview_key_raw] = raw_import
-                # clear old previews if a new file is uploaded
-                st.session_state.pop(preview_key_good, None)
-                st.session_state.pop(preview_key_bad, None)
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
-                st.session_state[preview_key_raw] = pd.DataFrame()
-                st.session_state.pop(preview_key_good, None)
-                st.session_state.pop(preview_key_bad, None)
+            sig = _file_signature(up)
+            prev_sig = st.session_state.get(file_sig_key)
+            if sig != prev_sig:
+                st.session_state[file_sig_key] = sig
+                try:
+                    raw_import = parse_simple_txn_csv(up)
+                    st.session_state[preview_key_raw] = raw_import
+                    st.session_state.pop(preview_key_good, None)
+                    st.session_state.pop(preview_key_bad, None)
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+                    st.session_state[preview_key_raw] = pd.DataFrame()
+                    st.session_state.pop(preview_key_good, None)
+                    st.session_state.pop(preview_key_bad, None)
 
         raw_import = st.session_state.get(preview_key_raw, pd.DataFrame())
 
         if isinstance(raw_import, pd.DataFrame) and not raw_import.empty:
-            st.write("Parsed rows (raw):")
+            st.write("Parsed rows (pre-price fill):")
             st.dataframe(raw_import, use_container_width=True)
 
             if st.button("Preview with prices", key=f"bulk_preview_btn__{active}"):
-                good, bad = enrich_import_with_prices(raw_import, prefer_uploaded=bool(st.session_state[prefer_price_key]))
+                good, bad = enrich_import_with_prices(raw_import)
                 st.session_state[preview_key_good] = good
                 st.session_state[preview_key_bad] = bad
                 st.rerun()
@@ -1785,11 +1785,11 @@ Notes:
         bad = st.session_state.get(preview_key_bad, pd.DataFrame())
 
         if isinstance(bad, pd.DataFrame) and not bad.empty:
-            st.warning(f"Skipped: {len(bad)} rows (price missing and could not fetch).")
+            st.warning(f"Skipped: {len(bad)} rows.")
             st.dataframe(bad, use_container_width=True)
 
         if isinstance(good, pd.DataFrame) and not good.empty:
-            st.success(f"Ready to import: {len(good)} rows (prices resolved).")
+            st.success(f"Ready to import: {len(good)} rows.")
             st.dataframe(good, use_container_width=True)
 
             if st.button("✅ Import into portfolio", type="primary", key=f"bulk_import_btn__{active}"):
@@ -2013,17 +2013,6 @@ Notes:
    - Acquisition date
 5. Enter only **new** transactions after the as-of date in **Transactions**
 
-### CSV bulk upload format
-
-Headers:
-
-**TICKER | TRANSACTION TYPE | DATE | SHARE COUNT | PRICE**
-
-- **PRICE is optional**
-  - If provided and “Prefer uploaded PRICE” is ON, we use it.
-  - If missing/invalid, we auto-fill from Yahoo close on/before DATE.
-  - If “Prefer uploaded PRICE” is OFF, we ignore uploaded prices and fetch for all rows.
-
 ### Shorting
 
 - Use **short** to open / increase a short position (cash increases).
@@ -2033,6 +2022,17 @@ Headers:
 - This app enforces **no negative cash** (no margin loans). If a transaction would make cash go negative, it is rejected.
 
 **Dividends:** estimated dividend accrual is calculated on LONG shares only (does not model borrow costs / dividends-in-lieu on shorts).
+
+### Bulk upload CSV
+
+Required headers:
+- TICKER
+- TRANSACTION TYPE
+- DATE
+- SHARE COUNT
+
+Optional:
+- PRICE  (if blank/missing, we fetch Yahoo close on/before DATE)
 """
         )
 
