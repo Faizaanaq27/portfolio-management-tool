@@ -71,6 +71,7 @@ BASELINE_COLS = ["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shar
 # - cover: buy-to-cover reduce/close short
 # - dividend: cash dividend
 VALID_TXN_TYPES = ["buy", "sell", "short", "cover", "dividend"]
+PORTFOLIO_MIN_DATE = date(2000, 1, 1)
 
 
 def _clean_str(x) -> str:
@@ -1520,7 +1521,7 @@ if is_admin:
     with st.form("create_portfolio_form", clear_on_submit=True):
         new_name = st.text_input("Name", placeholder="e.g., Long Only, Trading, IRA")
         new_mode = st.selectbox("Start mode", VALID_MODES, index=0)
-        new_asof = st.date_input("As-of date", value=date.today())
+        new_asof = st.date_input("As-of date", value=date.today(), min_value=PORTFOLIO_MIN_DATE)
         new_cash = st.number_input("Starting cash ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
         submitted = st.form_submit_button("Add portfolio")
 
@@ -1896,7 +1897,7 @@ Notes:
 
         with st.form("edit_portfolio_form"):
             mode_u = st.selectbox("Start mode", VALID_MODES, index=VALID_MODES.index(meta["start_mode"]))
-            asof_u = st.date_input("As-of date", value=meta["as_of_date"].date())
+            asof_u = st.date_input("As-of date", value=meta["as_of_date"].date(), min_value=PORTFOLIO_MIN_DATE)
             cash_u = st.number_input(
                 "Starting cash ($)",
                 min_value=0.0,
