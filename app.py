@@ -259,6 +259,33 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
     return px
 
 
+def fetch_prices_on_or_before(tickers: list[str], d: date) -> pd.Series:
+    """
+    For each ticker, returns close price on or BEFORE date d.
+    If d is today/future, falls back to latest available close.
+    """
+    cleaned = sorted(set([str(x).upper().strip() for x in tickers if str(x).strip()]))
+    if not cleaned:
+        return pd.Series(dtype=float)
+
+    target = pd.to_datetime(d).normalize()
+    today_n = pd.to_datetime(date.today()).normalize()
+
+    if target >= today_n:
+        return fetch_last_prices(cleaned)
+
+    start = target - pd.Timedelta(days=14)
+    px = fetch_price_history(cleaned, start=start, end=target)
+    if px is None or px.empty:
+        return pd.Series(dtype=float)
+
+    px = px[px.index <= target]
+    if px.empty:
+        return pd.Series(dtype=float)
+
+    return px.iloc[-1].astype(float)
+
+
 @st.cache_data(ttl=1800)
 def fetch_close_on_or_before(ticker: str, d: date) -> float | None:
     """
@@ -701,14 +728,23 @@ def validate_candidate_state(
     return True, ""
 
 
-def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.DataFrame, method: str):
+def portfolio_snapshot(
+    portfolio_meta: dict,
+    txns: pd.DataFrame,
+    baseline: pd.DataFrame,
+    method: str,
+    valuation_date: date | None = None,
+):
     as_of = pd.to_datetime(portfolio_meta["as_of_date"])
     start_mode = portfolio_meta["start_mode"]
     starting_cash = float(portfolio_meta["starting_cash"])
 
+    eval_date = pd.to_datetime(valuation_date if valuation_date is not None else date.today()).normalize()
+
     df = txns.copy()
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"])
+        df = df[df["date"] <= eval_date].copy()
 
     if start_mode == "snapshot_start" and not df.empty:
         df = df[df["date"] >= as_of].copy()
@@ -724,7 +760,7 @@ def portfolio_snapshot(portfolio_meta: dict, txns: pd.DataFrame, baseline: pd.Da
 
     if not open_lots.empty:
         tickers = sorted(open_lots["ticker"].unique().tolist())
-        live = fetch_last_prices(tickers)
+        live = fetch_prices_on_or_before(tickers, eval_date.date())
 
         lots_view = open_lots.copy()
         lots_view["last_price"] = lots_view["ticker"].map(live).astype(float)
@@ -1085,6 +1121,7 @@ def build_contribution_table(snap: dict) -> pd.DataFrame:
     return out
 
 
+def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) -> pd.DataFrame:
 def build_price_breakdown_table(snap: dict) -> pd.DataFrame:
     entry_rows = []
 
@@ -1148,6 +1185,8 @@ def build_price_breakdown_table(snap: dict) -> pd.DataFrame:
     out = pd.DataFrame({"ticker": tickers})
     out = out.merge(buy_avg, on="ticker", how="left").merge(sold_avg, on="ticker", how="left")
 
+    eval_date = valuation_date if valuation_date is not None else date.today()
+    live = fetch_prices_on_or_before(tickers, eval_date)
     live = fetch_last_prices(tickers)
     out["current_price"] = out["ticker"].map(live)
 
@@ -1340,6 +1379,12 @@ st.title("Brown Investment Group Portfolio")
 st.caption("Public view is read-only. Admin can edit portfolios, baseline lots, and transactions.")
 
 st.sidebar.header("Settings")
+analyze_on_date = st.sidebar.date_input(
+    "Analyze on date",
+    value=date.today(),
+    key="sidebar_analyze_on_date",
+    help="All holdings, P&L, NAV, and contribution analytics are evaluated as of this date.",
+)
 match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
 
 freq_choice = st.sidebar.selectbox("Chart frequency", ["Weekly (Mon)", "Daily"], index=0)
@@ -1350,12 +1395,17 @@ st.subheader("Public View (read-only)")
 public_tabs = st.tabs(["Overview"] + portfolio_names)
 
 
-def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy_px: pd.Series | None = None):
+def render_public_portfolio(
+    pname: str,
+    analyze_date: date,
+    nav_series: pd.Series | None = None,
+    spy_px: pd.Series | None = None,
+):
     meta = get_portfolio_meta(portfolios_df, pname)
     p_txns = txns_all[txns_all["portfolio"] == pname].copy()
     p_base = baseline_all[baseline_all["portfolio"] == pname].copy()
 
-    snap = portfolio_snapshot(meta, p_txns, p_base, match_method)
+    snap = portfolio_snapshot(meta, p_txns, p_base, match_method, valuation_date=analyze_date)
 
     if snap["start_mode"] == "snapshot_start":
         st.info(
@@ -1364,6 +1414,8 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
         )
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
+
+    st.caption(f"Analysis date: **{pd.to_datetime(analyze_date).date().isoformat()}**")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Starting Cash", f"${snap['starting_cash']:,.2f}")
@@ -1375,7 +1427,7 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     d1.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
     d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
 
-    divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(date.today()))
+    divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(analyze_date))
     st.metric("Dividends (estimated, quarterly accrual)", f"${float(divpack['total']):,.2f}")
 
     st.divider()
@@ -1411,6 +1463,7 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
         st.bar_chart(chart_df)
 
     st.markdown("### Contribution to return — price breakdown by ticker")
+    px_breakdown = build_price_breakdown_table(snap, valuation_date=analyze_date)
     px_breakdown = build_price_breakdown_table(snap)
     if px_breakdown.empty:
         st.info("No price breakdown available yet (need holdings and/or closed trades).")
@@ -1488,7 +1541,7 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
 with public_tabs[0]:
     st.markdown("## Overview")
 
-    end_date = pd.to_datetime(date.today())
+    end_date = pd.to_datetime(analyze_on_date)
     nav_series_map = {}
     cash_now_by_port = {}
     pnl_now_by_port = {}
@@ -1499,7 +1552,7 @@ with public_tabs[0]:
         p_txns = txns_all[txns_all["portfolio"] == p].copy()
         p_base = baseline_all[baseline_all["portfolio"] == p].copy()
 
-        snap = portfolio_snapshot(meta, p_txns, p_base, match_method)
+        snap = portfolio_snapshot(meta, p_txns, p_base, match_method, valuation_date=analyze_on_date)
         cash_now_by_port[p] = snap["cash"]
         pnl_now_by_port[p] = snap["realized_pnl"] + snap["unrealized_pnl"]
 
@@ -1603,7 +1656,7 @@ for i, p in enumerate(portfolio_names, start=1):
                         spy_aligned = spy_daily.reindex(pd.date_range(s0, s1, freq="D")).ffill()
                         spy_aligned = spy_aligned.reindex(nav.index).ffill()
 
-        render_public_portfolio(p, nav_series=nav, spy_px=spy_aligned)
+        render_public_portfolio(p, analyze_date=analyze_on_date, nav_series=nav, spy_px=spy_aligned)
 
 # ---------- Admin section ----------
 if is_admin:
