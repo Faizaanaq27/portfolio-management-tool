@@ -1603,6 +1603,29 @@ portfolio_names = portfolios_df["portfolio"].tolist()
 # =========================
 st.title("Brown Investment Group Portfolio")
 st.caption("Public view is read-only. Admin can edit portfolios, baseline lots, and transactions.")
+st.markdown(
+    """
+    <style>
+        .review-box {
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 0.75rem;
+            padding: 0.9rem 1rem;
+            background: rgba(240, 242, 246, 0.45);
+            margin-bottom: 0.8rem;
+        }
+        .review-box h4 {
+            margin: 0 0 0.4rem 0;
+            font-size: 1rem;
+        }
+        .review-box ul {
+            margin: 0;
+            padding-left: 1.1rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.sidebar.header("Settings")
 analyze_on_date = st.sidebar.date_input(
     "Analyze on date",
@@ -1641,52 +1664,34 @@ def render_public_portfolio(
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
 
+    st.markdown(
+        """
+        <div class="review-box">
+            <h4>How to review this portfolio</h4>
+            <ul>
+                <li><b>Health:</b> Start with NAV, cash, and market value to understand size and liquidity.</li>
+                <li><b>Performance:</b> Use P&amp;L, drawdown, and relative growth to judge outcomes over time.</li>
+                <li><b>Drivers:</b> Review sector allocation and ticker contribution to see what is helping or hurting.</li>
+                <li><b>Risk:</b> Check beta/alpha vs SPY and concentration in holdings/lots.</li>
+            </ul>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.caption(f"Analysis date: **{pd.to_datetime(analyze_date).date().isoformat()}**")
 
     credit_income_total = float(credit_income_report["total_credit_income"].sum()) if not credit_income_report.empty else 0.0
     divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(analyze_date))
-    dividend_total = (
-        pd.to_numeric(
-            snap["filtered_txns"].loc[snap["filtered_txns"]["type"] == "dividend", "amount"],
-            errors="coerce",
-        )
-        .fillna(0.0)
-        .sum()
-        if not snap["filtered_txns"].empty
-        else 0.0
-    )
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("NAV", f"${snap['nav']:,.2f}")
-    c2.metric("Equity (Market Value)", f"${snap['market_value']:,.2f}")
-    c3.metric("Cash", f"${snap['cash']:,.2f}")
-
-    d1, d2, d3, d4, d5 = st.columns(5)
-    d1.metric("Starting Cash", f"${snap['starting_cash']:,.2f}")
-    d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
-    d3.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
-    d4.metric("Dividend", f"${dividend_total:,.2f}")
-    d5.metric("Cash Income from Credit", f"${credit_income_total:,.2f}")
-
-    pnl_total = snap["realized_pnl"] + snap["unrealized_pnl"]
-    recon_nav = snap["starting_cash"] + pnl_total + dividend_total + credit_income_total
-    recon_delta = snap["nav"] - recon_nav
-    st.caption(
-        "NAV check: Starting Cash + (Realized P&L + Unrealized P&L) + Dividend + Cash Income from Credit "
-        f"= ${recon_nav:,.2f} (Δ vs NAV: ${recon_delta:,.2f})"
-    )
+    st.metric("Dividends (estimated, quarterly accrual)", f"${float(divpack['total']):,.2f}")
 
     section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Position Details"])
 
     with section_tabs[0]:
-        st.markdown("### All-time performance (NAV)")
+        st.markdown("### Drawdown")
         if nav_series is None or nav_series.dropna().empty:
-            st.info("No NAV series yet.")
+            st.info("No NAV series yet for drawdown.")
         else:
-            nav_chart = nav_series.dropna().to_frame(name="NAV")
-            st.line_chart(nav_chart)
-
-            st.markdown("### Drawdown")
             dd = compute_drawdown(nav_series)
             st.line_chart(dd)
 
