@@ -1186,7 +1186,6 @@ def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) 
 
     eval_date = valuation_date if valuation_date is not None else date.today()
     live = fetch_prices_on_or_before(tickers, eval_date)
-    live = fetch_last_prices(tickers)
     out["current_price"] = out["ticker"].map(live)
 
     return out.sort_values("ticker").reset_index(drop=True)
@@ -1463,7 +1462,6 @@ def render_public_portfolio(
 
     st.markdown("### Contribution to return — price breakdown by ticker")
     px_breakdown = build_price_breakdown_table(snap, valuation_date=analyze_date)
-    px_breakdown = build_price_breakdown_table(snap)
     if px_breakdown.empty:
         st.info("No price breakdown available yet (need holdings and/or closed trades).")
     else:
