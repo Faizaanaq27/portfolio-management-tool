@@ -1122,7 +1122,6 @@ def build_contribution_table(snap: dict) -> pd.DataFrame:
 
 
 def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) -> pd.DataFrame:
-def build_price_breakdown_table(snap: dict) -> pd.DataFrame:
     entry_rows = []
 
     if snap.get("lots") is not None and not snap["lots"].empty:
