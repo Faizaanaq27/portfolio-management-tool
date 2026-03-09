@@ -1681,16 +1681,7 @@ def render_public_portfolio(
 
     st.caption(f"Analysis date: **{pd.to_datetime(analyze_date).date().isoformat()}**")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Starting Cash", f"${snap['starting_cash']:,.2f}")
-    c2.metric("Cash", f"${snap['cash']:,.2f}")
-    c3.metric("Market Value (signed)", f"${snap['market_value']:,.2f}")
-    c4.metric("NAV", f"${snap['nav']:,.2f}")
-
-    d1, d2 = st.columns(2)
-    d1.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
-    d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
-
+    credit_income_total = float(credit_income_report["total_credit_income"].sum()) if not credit_income_report.empty else 0.0
     divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(analyze_date))
     st.metric("Dividends (estimated, quarterly accrual)", f"${float(divpack['total']):,.2f}")
 
