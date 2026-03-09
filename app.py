@@ -2,13 +2,12 @@
 import hmac
 from datetime import date
 from pathlib import Path
-import re
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Multi-Portfolio Tracker (Cash + Snapshot)", layout="wide")
 
@@ -74,9 +73,10 @@ VALID_TXN_TYPES = ["buy", "sell", "short", "cover", "dividend", "credit_interest
 PORTFOLIO_MIN_DATE = date(2000, 1, 1)
 
 # Monthly auto-credit model:
-# interest for a completed month = beginning_of_month_cash * ((avg SOFR + spread) / 100) / 12
+# interest for a completed month
+# = beginning_of_month_cash * max(^IRX - haircut, 0) / 12
 DEFAULT_CREDIT_SPREAD_PCT = 0.50
-SOFR_FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SOFR"
+IRX_PROXY_TICKER = "^IRX"
 
 
 def _clean_str(x) -> str:
@@ -102,7 +102,9 @@ def load_portfolios() -> pd.DataFrame:
 
     df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce")
     df["starting_cash"] = pd.to_numeric(df["starting_cash"], errors="coerce").fillna(0.0)
-    df["credit_spread_pct"] = pd.to_numeric(df["credit_spread_pct"], errors="coerce").fillna(DEFAULT_CREDIT_SPREAD_PCT)
+    df["credit_spread_pct"] = (
+        pd.to_numeric(df["credit_spread_pct"], errors="coerce").fillna(DEFAULT_CREDIT_SPREAD_PCT)
+    )
 
     if "Main" not in set(df["portfolio"].tolist()):
         df = pd.concat(
@@ -344,6 +346,30 @@ def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) 
     out = pd.Series(div.values, index=idx, name=t).sort_index()
     out = out[(out.index >= s) & (out.index <= e)].copy()
     return out.astype(float)
+
+
+@st.cache_data(ttl=3600)
+def fetch_latest_irx_rate_pct() -> float | None:
+    try:
+        data = yf.download(IRX_PROXY_TICKER, period="5d", interval="1d", auto_adjust=False, progress=False)
+        if data is None or data.empty:
+            return None
+
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            if IRX_PROXY_TICKER not in close.columns:
+                return None
+            s = close[IRX_PROXY_TICKER]
+        else:
+            s = close
+
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            return None
+
+        return float(s.iloc[-1])
+    except Exception:
+        return None
 
 
 # =========================
@@ -645,61 +671,6 @@ def _cash_start_boundary(meta: dict, txns: pd.DataFrame) -> pd.Timestamp:
     return min(as_of, d.min().normalize())
 
 
-@st.cache_data(ttl=3600)
-def fetch_latest_irx_rate_pct() -> float | None:
-    try:
-        data = yf.download(IRX_PROXY_TICKER, period="5d", interval="1d", auto_adjust=False, progress=False)
-        if data is None or data.empty:
-            return None
-
-        close = data["Close"]
-        if isinstance(close, pd.DataFrame):
-            if IRX_PROXY_TICKER not in close.columns:
-                return None
-            s = close[IRX_PROXY_TICKER]
-        else:
-            s = close
-
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if s.empty:
-            return None
-
-        return float(s.iloc[-1])
-    except Exception:
-        return None
-
-
-def estimate_credit_interest(cash_balance: float) -> float:
-    try:
-        cash = float(cash_balance)
-    except Exception:
-        print("Could not estimate credit interest: invalid cash balance.")
-        return 0.0
-
-    if cash <= 0:
-        print("Could not estimate credit interest: cash balance must be positive.")
-        return 0.0
-
-    irx_rate_pct = fetch_latest_irx_rate_pct()
-    if irx_rate_pct is None or not np.isfinite(irx_rate_pct):
-        print("Could not estimate credit interest: failed to fetch latest ^IRX rate.")
-        return 0.0
-
-    irx_decimal = irx_rate_pct / 100.0
-    wf_rate_decimal = max(irx_decimal - (WF_SPREAD_ADJUSTMENT_PCT / 100.0), 0.0)
-    monthly_rate = wf_rate_decimal / 12.0
-    est_interest = cash * monthly_rate
-
-    print(
-        "Credit Interest Estimate | "
-        f"^IRX: {irx_rate_pct:.4f}% | "
-        f"Implied WF Rate: {wf_rate_decimal * 100.0:.4f}% | "
-        f"Estimated Monthly Interest: ${est_interest:,.2f}"
-    )
-
-    return float(est_interest)
-
-
 def build_auto_credit_interest_txns(
     portfolio_meta: dict,
     portfolio_txns_all: pd.DataFrame,
@@ -729,7 +700,6 @@ def build_auto_credit_interest_txns(
     if not months:
         return pd.DataFrame(columns=TXN_COLS)
 
-
     if txns.empty:
         work = pd.DataFrame(columns=TXN_COLS + ["month"])
     else:
@@ -742,38 +712,46 @@ def build_auto_credit_interest_txns(
 
     running_cash = float(portfolio_meta["starting_cash"])
     auto_rows = []
+
     irx_rate_pct = fetch_latest_irx_rate_pct()
+    if irx_rate_pct is None or not np.isfinite(irx_rate_pct):
+        return pd.DataFrame(columns=TXN_COLS)
+
+    haircut_pct = float(portfolio_meta.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT))
+    implied_annual_rate_pct = max(irx_rate_pct - haircut_pct, 0.0)
 
     for month in months:
-        month_txns = work[work["month"] == month].sort_values(["date", "txn_id"]) if not work.empty else pd.DataFrame()
+        month_txns = (
+            work[work["month"] == month].sort_values(["date", "txn_id"])
+            if not work.empty
+            else pd.DataFrame()
+        )
         month_start_cash = running_cash
+        month_had_auto = False
 
         if month not in manual_credit_months and month_start_cash > 1e-12:
-            sofr = float(sofr_monthly.get(month, np.nan)) if len(sofr_monthly) else np.nan
-            if np.isfinite(sofr):
-                spread_pct = float(portfolio_meta.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT))
-                annual_rate = (sofr + spread_pct) / 100.0
-                interest_amt = round(month_start_cash * annual_rate / 12.0, 2)
+            interest_amt = round(month_start_cash * (implied_annual_rate_pct / 100.0) / 12.0, 2)
 
-                if interest_amt > 0:
-                    month_end = month.end_time.normalize()
-                    auto_rows.append(
-                        {
-                            "txn_id": f"auto_credit_interest__{portfolio_meta['portfolio']}__{month.strftime('%Y%m')}",
-                            "portfolio": portfolio_meta["portfolio"],
-                            "date": month_end,
-                            "type": "credit_interest",
-                            "ticker": "",
-                            "shares": np.nan,
-                            "price": np.nan,
-                            "amount": float(interest_amt),
-                        }
-                    )
+            if interest_amt > 0:
+                month_end = month.end_time.normalize()
+                auto_rows.append(
+                    {
+                        "txn_id": f"auto_credit_interest__{portfolio_meta['portfolio']}__{month.strftime('%Y%m')}",
+                        "portfolio": portfolio_meta["portfolio"],
+                        "date": month_end,
+                        "type": "credit_interest",
+                        "ticker": "",
+                        "shares": np.nan,
+                        "price": np.nan,
+                        "amount": float(interest_amt),
+                    }
+                )
+                month_had_auto = True
 
         if month_txns is not None and not month_txns.empty:
             running_cash += float(month_txns.apply(cash_delta, axis=1).sum())
 
-        if auto_rows and auto_rows[-1]["txn_id"].endswith(month.strftime("%Y%m")):
+        if month_had_auto:
             running_cash += float(auto_rows[-1]["amount"])
 
     if not auto_rows:
@@ -817,7 +795,7 @@ def build_monthly_credit_income_report(effective_txns: pd.DataFrame) -> pd.DataF
 
     tx = effective_txns.copy()
     tx["date"] = pd.to_datetime(tx["date"], errors="coerce")
-    tx = tx.dropna(subset=["date"])  # defensive
+    tx = tx.dropna(subset=["date"])
     tx = tx[tx["type"] == "credit_interest"].copy()
     if tx.empty:
         return pd.DataFrame(columns=["month", "manual_credit_income", "auto_credit_income", "total_credit_income"])
@@ -1627,7 +1605,9 @@ def render_public_portfolio(
         show_credit = credit_income_report.copy()
         show_credit["month"] = pd.to_datetime(show_credit["month"]).dt.strftime("%Y-%m")
         st.dataframe(show_credit, use_container_width=True)
-        st.bar_chart(credit_income_report.set_index("month")[["total_credit_income"]].sort_index())
+        chart_credit = credit_income_report.copy()
+        chart_credit["month"] = pd.to_datetime(chart_credit["month"])
+        st.bar_chart(chart_credit.set_index("month")[["total_credit_income"]].sort_index())
 
     st.divider()
     st.markdown("## Tier 1 Analytics")
@@ -1886,7 +1866,12 @@ if is_admin:
         new_mode = st.selectbox("Start mode", VALID_MODES, index=0)
         new_asof = st.date_input("As-of date", value=date.today(), min_value=PORTFOLIO_MIN_DATE)
         new_cash = st.number_input("Starting cash ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
-        new_credit_spread = st.number_input("Credit spread above SOFR (% annual)", value=DEFAULT_CREDIT_SPREAD_PCT, step=0.05, format="%.2f")
+        new_credit_spread = st.number_input(
+            "IRX haircut / spread (% annual)",
+            value=DEFAULT_CREDIT_SPREAD_PCT,
+            step=0.05,
+            format="%.2f",
+        )
         submitted = st.form_submit_button("Add portfolio")
 
     if submitted:
@@ -2002,7 +1987,7 @@ if is_admin:
                 st.caption(
                     "Non-trade cash income rows supported: "
                     "**dividend** and **credit_interest**. "
-                    "Auto monthly credit_interest is also generated using average SOFR + your configured spread on beginning cash."
+                    "Auto monthly credit_interest is generated using beginning-of-month cash and latest ^IRX less your configured haircut."
                 )
                 c1, c2 = st.columns([1, 1])
                 with c1:
@@ -2257,7 +2242,7 @@ Notes:
                 format="%.2f",
             )
             spread_u = st.number_input(
-                "Credit spread above SOFR (% annual)",
+                "IRX haircut / spread (% annual)",
                 value=float(meta.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT)),
                 step=0.05,
                 format="%.2f",
@@ -2379,8 +2364,8 @@ Notes:
 - `credit_interest` is supported as a real cash-income transaction type.
 - The app also auto-generates monthly `credit_interest` for completed months using:
   - beginning-of-month cash
-  - average monthly SOFR from FRED
-  - plus a configurable annual spread (default **0.50%**) set in Portfolio Settings
+  - latest **^IRX** as a proxy for cash yield
+  - minus a configurable annual haircut/spread (default **0.50%**) set in Portfolio Settings
 - If a manual `credit_interest` transaction already exists in a month, auto-accrual is skipped for that month.
 
 **Dividends:** estimated dividend accrual is calculated on LONG shares only (does not model borrow costs / dividends-in-lieu on shorts).
