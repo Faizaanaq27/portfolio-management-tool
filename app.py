@@ -61,7 +61,6 @@ BASELINE_PATH = "baseline_lots.csv"
 TXN_COLS = ["txn_id", "portfolio", "date", "type", "ticker", "shares", "price", "amount"]
 PORTFOLIO_COLS = ["portfolio", "start_mode", "as_of_date", "starting_cash"]
 VALID_MODES = ["ledger_complete", "snapshot_start"]
-# NOTE: shares_open can be POSITIVE (long) or NEGATIVE (short) for snapshot portfolios
 BASELINE_COLS = ["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shares_open"]
 
 # Transaction types:
@@ -70,8 +69,14 @@ BASELINE_COLS = ["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shar
 # - short: open/increase short (borrow+sell)
 # - cover: buy-to-cover reduce/close short
 # - dividend: cash dividend
-VALID_TXN_TYPES = ["buy", "sell", "short", "cover", "dividend"]
+# - credit_interest: cash sweep / monthly interest credit
+VALID_TXN_TYPES = ["buy", "sell", "short", "cover", "dividend", "credit_interest"]
 PORTFOLIO_MIN_DATE = date(2000, 1, 1)
+
+# Monthly auto-credit model:
+# interest for a completed month = beginning_of_month_cash * ((avg SOFR + spread) / 100) / 12
+AUTO_CREDIT_SPREAD_PCT = 0.50
+SOFR_FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SOFR"
 
 
 def _clean_str(x) -> str:
@@ -167,11 +172,11 @@ def load_txns() -> pd.DataFrame:
     trades = df[is_trade].dropna(subset=["ticker", "shares", "price"]).copy()
     trades = trades[(trades["shares"] > 0) & (trades["price"] >= 0)]
 
-    divs = df[~is_trade].dropna(subset=["amount"]).copy()
-    divs = divs[divs["amount"] >= 0]
-    divs["ticker"] = divs["ticker"].fillna("").astype(str)
+    income_rows = df[~is_trade].dropna(subset=["amount"]).copy()
+    income_rows = income_rows[income_rows["amount"] >= 0]
+    income_rows["ticker"] = income_rows["ticker"].fillna("").astype(str)
 
-    out = pd.concat([trades, divs], ignore_index=True)
+    out = pd.concat([trades, income_rows], ignore_index=True)
     return out.sort_values(["portfolio", "date", "txn_id"]).reset_index(drop=True)
 
 
@@ -204,7 +209,6 @@ def load_baseline() -> pd.DataFrame:
     df["shares_open"] = pd.to_numeric(df["shares_open"], errors="coerce")
 
     df = df.dropna(subset=["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shares_open"])
-    # allow negative shares_open (short baseline), but not zero
     df = df[(df["shares_open"].abs() > 1e-12) & (df["buy_price"] >= 0)]
     return df.sort_values(["portfolio", "ticker", "buy_date", "lot_id"]).reset_index(drop=True)
 
@@ -260,10 +264,6 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
 
 
 def fetch_prices_on_or_before(tickers: list[str], d: date) -> pd.Series:
-    """
-    For each ticker, returns close price on or BEFORE date d.
-    If d is today/future, falls back to latest available close.
-    """
     cleaned = sorted(set([str(x).upper().strip() for x in tickers if str(x).strip()]))
     if not cleaned:
         return pd.Series(dtype=float)
@@ -288,9 +288,6 @@ def fetch_prices_on_or_before(tickers: list[str], d: date) -> pd.Series:
 
 @st.cache_data(ttl=1800)
 def fetch_close_on_or_before(ticker: str, d: date) -> float | None:
-    """
-    Close price on or BEFORE date d (handles weekends/holidays).
-    """
     t = str(ticker).upper().strip()
     if not t:
         return None
@@ -320,10 +317,6 @@ def fetch_close_on_or_before(ticker: str, d: date) -> float | None:
 
 @st.cache_data(ttl=3600)
 def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
-    """
-    yfinance dividends sometimes come back tz-aware; we normalize to tz-naive midnight.
-    Returns dividend per share events between [start, end].
-    """
     t = str(ticker).upper().strip()
     s = pd.to_datetime(start).normalize()
     e = pd.to_datetime(end).normalize()
@@ -369,11 +362,6 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 # 2d) Bulk upload helpers (CSV)
 # =========================
 def _parse_number_allow_parens(x):
-    """
-    Accepts numbers like:
-      10, -10, (10), "  (10)  "
-    Returns float or np.nan.
-    """
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
     s = str(x).strip()
@@ -399,11 +387,11 @@ def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
       TICKER | TRANSACTION TYPE | DATE | SHARE COUNT
 
     Optional columns:
-      PRICE   (if omitted/blank => filled from Yahoo close-on-or-before date)
+      PRICE
 
     Returns normalized df:
       ticker, type, date, shares, price
-    Only keeps type in {buy, sell, short, cover}.
+    Only keeps trade type in {buy, sell, short, cover}.
     """
     df = pd.read_csv(uploaded_file)
     df.columns = [str(c).strip().upper() for c in df.columns]
@@ -434,13 +422,6 @@ def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
 
 
 def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Ensures there is a valid 'price' for every row.
-    - If import_df has a non-null price, we keep it.
-    - Otherwise we fetch close-on-or-before (ticker, date).
-
-    Returns: (good_df, bad_df)
-    """
     if import_df is None or import_df.empty:
         return import_df, pd.DataFrame()
 
@@ -478,12 +459,6 @@ def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd
 # 3) Lot engine + accounting (LONG + SHORT)
 # =========================
 def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, side: str):
-    """
-    Reduce existing exposure by matching lots.
-
-    side="LONG": reduce positive shares by consuming positive lots toward 0
-    side="SHORT": reduce short by consuming negative lots toward 0 (increase toward 0)
-    """
     realized_rows = []
     remaining = float(reduce_shares)
 
@@ -506,7 +481,7 @@ def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, si
             remaining -= take
             realized_rows.append((lot, take))
 
-        else:  # SHORT
+        else:
             if sh_open >= -1e-12:
                 i += 1
                 continue
@@ -522,14 +497,6 @@ def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, si
 
 
 def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, method: str):
-    """
-    Lots support:
-      - shares_open > 0 : long lots (entry = buy_price)
-      - shares_open < 0 : short lots (entry = short_price stored in buy_price)
-    Realized PnL:
-      - LONG: shares_sold * (sell_price - entry)
-      - SHORT: shares_covered * (entry - cover_price)
-    """
     open_cols = ["lot_id", "ticker", "buy_date", "buy_price", "shares_open"]
     real_cols = [
         "sale_id",
@@ -641,7 +608,7 @@ def cash_delta(row: pd.Series) -> float:
         return +float(row["shares"]) * float(row["price"])
     if typ == "cover":
         return -float(row["shares"]) * float(row["price"])
-    if typ == "dividend":
+    if typ in ["dividend", "credit_interest"]:
         return +float(row["amount"])
     return 0.0
 
@@ -649,10 +616,166 @@ def cash_delta(row: pd.Series) -> float:
 def get_portfolio_meta(portfolios_df: pd.DataFrame, portfolio: str):
     r = portfolios_df.loc[portfolios_df["portfolio"] == portfolio].iloc[0]
     return {
+        "portfolio": str(portfolio),
         "start_mode": str(r["start_mode"]),
         "as_of_date": pd.to_datetime(r["as_of_date"]),
         "starting_cash": float(r["starting_cash"]),
     }
+
+
+def _cash_start_boundary(meta: dict, txns: pd.DataFrame) -> pd.Timestamp:
+    as_of = pd.to_datetime(meta["as_of_date"]).normalize()
+
+    if meta["start_mode"] == "snapshot_start":
+        return as_of
+
+    if txns is None or txns.empty:
+        return as_of
+
+    d = pd.to_datetime(txns["date"], errors="coerce").dropna()
+    if d.empty:
+        return as_of
+
+    return min(as_of, d.min().normalize())
+
+
+@st.cache_data(ttl=86400)
+def fetch_sofr_monthly_avg(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.Series:
+    start = pd.to_datetime(start_date).normalize()
+    end = pd.to_datetime(end_date).normalize()
+
+    if end < start:
+        return pd.Series(dtype=float)
+
+    try:
+        raw = pd.read_csv(SOFR_FRED_CSV_URL)
+        raw.columns = [str(c).strip().upper() for c in raw.columns]
+        if "DATE" not in raw.columns or "SOFR" not in raw.columns:
+            return pd.Series(dtype=float)
+
+        raw["DATE"] = pd.to_datetime(raw["DATE"], errors="coerce")
+        raw["SOFR"] = pd.to_numeric(raw["SOFR"], errors="coerce")
+        raw = raw.dropna(subset=["DATE", "SOFR"]).copy()
+
+        raw = raw[(raw["DATE"] >= start) & (raw["DATE"] <= end)].copy()
+        if raw.empty:
+            return pd.Series(dtype=float)
+
+        raw["MONTH"] = raw["DATE"].dt.to_period("M")
+        monthly = raw.groupby("MONTH")["SOFR"].mean().sort_index()
+        return monthly.astype(float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def build_auto_credit_interest_txns(
+    portfolio_meta: dict,
+    portfolio_txns_all: pd.DataFrame,
+    valuation_date: date | None = None,
+) -> pd.DataFrame:
+    eval_date = pd.to_datetime(valuation_date if valuation_date is not None else date.today()).normalize()
+    txns = portfolio_txns_all.copy()
+
+    if txns.empty:
+        txns = pd.DataFrame(columns=TXN_COLS)
+    else:
+        txns["date"] = pd.to_datetime(txns["date"], errors="coerce")
+        txns = txns.dropna(subset=["date"]).copy()
+        txns = txns[txns["date"] <= eval_date].copy()
+
+    start_boundary = _cash_start_boundary(portfolio_meta, txns)
+
+    if portfolio_meta["start_mode"] == "snapshot_start" and not txns.empty:
+        txns = txns[txns["date"] >= pd.to_datetime(portfolio_meta["as_of_date"]).normalize()].copy()
+
+    if eval_date < start_boundary:
+        return pd.DataFrame(columns=TXN_COLS)
+
+    months = pd.period_range(start=start_boundary.to_period("M"), end=eval_date.to_period("M"), freq="M")
+    months = [m for m in months if m.end_time.normalize() <= eval_date]
+
+    if not months:
+        return pd.DataFrame(columns=TXN_COLS)
+
+    sofr_monthly = fetch_sofr_monthly_avg(start_boundary, eval_date)
+
+    if txns.empty:
+        work = pd.DataFrame(columns=TXN_COLS + ["month"])
+    else:
+        work = txns.copy()
+        work["month"] = pd.to_datetime(work["date"]).dt.to_period("M")
+
+    manual_credit_months = set()
+    if not work.empty:
+        manual_credit_months = set(work.loc[work["type"] == "credit_interest", "month"].tolist())
+
+    running_cash = float(portfolio_meta["starting_cash"])
+    auto_rows = []
+
+    for month in months:
+        month_txns = work[work["month"] == month].sort_values(["date", "txn_id"]) if not work.empty else pd.DataFrame()
+        month_start_cash = running_cash
+
+        if month not in manual_credit_months and month_start_cash > 1e-12:
+            sofr = float(sofr_monthly.get(month, np.nan)) if len(sofr_monthly) else np.nan
+            if np.isfinite(sofr):
+                annual_rate = (sofr + AUTO_CREDIT_SPREAD_PCT) / 100.0
+                interest_amt = round(month_start_cash * annual_rate / 12.0, 2)
+
+                if interest_amt > 0:
+                    month_end = month.end_time.normalize()
+                    auto_rows.append(
+                        {
+                            "txn_id": f"auto_credit_interest__{portfolio_meta['portfolio']}__{month.strftime('%Y%m')}",
+                            "portfolio": portfolio_meta["portfolio"],
+                            "date": month_end,
+                            "type": "credit_interest",
+                            "ticker": "",
+                            "shares": np.nan,
+                            "price": np.nan,
+                            "amount": float(interest_amt),
+                        }
+                    )
+
+        if month_txns is not None and not month_txns.empty:
+            running_cash += float(month_txns.apply(cash_delta, axis=1).sum())
+
+        if auto_rows and auto_rows[-1]["txn_id"].endswith(month.strftime("%Y%m")):
+            running_cash += float(auto_rows[-1]["amount"])
+
+    if not auto_rows:
+        return pd.DataFrame(columns=TXN_COLS)
+
+    auto_df = pd.DataFrame(auto_rows, columns=TXN_COLS)
+    auto_df["date"] = pd.to_datetime(auto_df["date"])
+    return auto_df
+
+
+def build_effective_txns(
+    portfolio_meta: dict,
+    portfolio_txns_all: pd.DataFrame,
+    valuation_date: date | None = None,
+) -> pd.DataFrame:
+    base = portfolio_txns_all.copy()
+    if base.empty:
+        base = pd.DataFrame(columns=TXN_COLS)
+    else:
+        base["date"] = pd.to_datetime(base["date"], errors="coerce")
+
+    auto_df = build_auto_credit_interest_txns(
+        portfolio_meta=portfolio_meta,
+        portfolio_txns_all=base,
+        valuation_date=valuation_date,
+    )
+
+    out = pd.concat([base, auto_df], ignore_index=True)
+    if out.empty:
+        return out
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date", "type"]).copy()
+    out = out.sort_values(["date", "txn_id"]).reset_index(drop=True)
+    return out
 
 
 def validate_candidate_state(
@@ -661,32 +784,34 @@ def validate_candidate_state(
     portfolio_baseline: pd.DataFrame,
     method: str,
 ) -> tuple[bool, str]:
-    """
-    Rules:
-    - Snapshot portfolios: no txns before as_of_date
-    - No negative CASH (still enforced: no margin loans)
-    - SELL can only reduce existing LONG shares
-    - COVER can only reduce existing SHORT shares
-    - SHORT can open/increase shorts (no cap here; cash constraint still applies)
-    """
-    start_mode = portfolio_meta["start_mode"]
-    as_of = pd.to_datetime(portfolio_meta["as_of_date"])
-    starting_cash = float(portfolio_meta["starting_cash"])
-
     txns = portfolio_txns_all.copy()
     if not txns.empty:
-        txns["date"] = pd.to_datetime(txns["date"])
-        txns = txns.sort_values(["date", "txn_id"])
+        txns["date"] = pd.to_datetime(txns["date"], errors="coerce")
+        txns = txns.dropna(subset=["date"]).copy()
+
+    start_mode = portfolio_meta["start_mode"]
+    as_of = pd.to_datetime(portfolio_meta["as_of_date"]).normalize()
 
     if start_mode == "snapshot_start" and not txns.empty:
         if (txns["date"] < as_of).any():
             return False, f"Snapshot portfolios cannot have transactions before as-of date ({as_of.date()})."
 
-    cash = starting_cash
-    for _, r in txns.iterrows():
-        cash += cash_delta(r)
-        if cash < -1e-9:
-            return False, "Invalid: cash would go negative (margin not allowed)."
+    validation_date = date.today()
+    if not txns.empty:
+        validation_date = pd.to_datetime(txns["date"]).max().date()
+
+    effective_txns = build_effective_txns(
+        portfolio_meta=portfolio_meta,
+        portfolio_txns_all=txns,
+        valuation_date=validation_date,
+    )
+
+    cash = float(portfolio_meta["starting_cash"])
+    if not effective_txns.empty:
+        for _, r in effective_txns.sort_values(["date", "txn_id"]).iterrows():
+            cash += cash_delta(r)
+            if cash < -1e-9:
+                return False, "Invalid: cash would go negative (margin not allowed)."
 
     trades = txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy()
     if trades.empty:
@@ -714,7 +839,7 @@ def validate_candidate_state(
 
         elif typ == "sell":
             if long_shares.get(t, 0.0) + 1e-12 < sh:
-                return False, f"Invalid SELL: not enough LONG shares of {t} to sell {sh:.3f}."
+                return False, f"Invalid SELL: not enough LONG shares of {t} to sell {sh:.4f}."
             long_shares[t] -= sh
 
         elif typ == "short":
@@ -722,7 +847,7 @@ def validate_candidate_state(
 
         elif typ == "cover":
             if short_shares.get(t, 0.0) + 1e-12 < sh:
-                return False, f"Invalid COVER: not enough SHORT shares of {t} to cover {sh:.3f}."
+                return False, f"Invalid COVER: not enough SHORT shares of {t} to cover {sh:.4f}."
             short_shares[t] -= sh
 
     return True, ""
@@ -741,7 +866,12 @@ def portfolio_snapshot(
 
     eval_date = pd.to_datetime(valuation_date if valuation_date is not None else date.today()).normalize()
 
-    df = txns.copy()
+    df = build_effective_txns(
+        portfolio_meta=portfolio_meta,
+        portfolio_txns_all=txns,
+        valuation_date=eval_date.date(),
+    )
+
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"])
         df = df[df["date"] <= eval_date].copy()
@@ -840,12 +970,18 @@ def compute_nav_series_for_portfolio(
     txns_all: pd.DataFrame,
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
-    chart_freq: str,  # "D" or "W-MON"
+    chart_freq: str,
 ) -> pd.Series:
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
-    txns = txns_all[txns_all["portfolio"] == pname].copy()
+    base_txns = txns_all[txns_all["portfolio"] == pname].copy()
+    txns = build_effective_txns(
+        portfolio_meta=meta,
+        portfolio_txns_all=base_txns,
+        valuation_date=end.date(),
+    )
+
     if not txns.empty:
         txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
         txns = txns.sort_values(["date", "txn_id"])
@@ -1015,9 +1151,6 @@ def rolling_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series, window: int = 26)
 
 
 def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    For portfolios with shorts, signed MV can be negative, so allocations use ABS exposure.
-    """
     rows = []
 
     if not snap["holdings"].empty:
@@ -1081,16 +1214,16 @@ def build_contribution_table(snap: dict) -> pd.DataFrame:
             realized_cost_basis=("realized_cost_basis", "sum"),
         )
 
-    divs = pd.DataFrame(columns=["ticker", "dividend_pnl"])
+    cash_income = pd.DataFrame(columns=["ticker", "dividend_pnl"])
     tx = snap["filtered_txns"]
     if tx is not None and not tx.empty:
-        d = tx[tx["type"] == "dividend"].copy()
+        d = tx[tx["type"].isin(["dividend", "credit_interest"])].copy()
         if not d.empty:
             d["ticker"] = d["ticker"].fillna("").astype(str).str.upper().str.strip()
             d.loc[d["ticker"] == "", "ticker"] = "CASH"
-            divs = d.groupby("ticker", as_index=False).agg(dividend_pnl=("amount", "sum"))
+            cash_income = d.groupby("ticker", as_index=False).agg(dividend_pnl=("amount", "sum"))
 
-    out = unreal.merge(realized, on="ticker", how="outer").merge(divs, on="ticker", how="outer")
+    out = unreal.merge(realized, on="ticker", how="outer").merge(cash_income, on="ticker", how="outer")
     if out.empty:
         return out
 
@@ -1145,7 +1278,11 @@ def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) 
             entry.groupby("ticker", as_index=False)
             .agg(total_shares=("shares_ref", "sum"), weighted=("weighted", "sum"))
         )
-        buy_avg["avg_buy_price"] = np.where(buy_avg["total_shares"] > 0, buy_avg["weighted"] / buy_avg["total_shares"], np.nan)
+        buy_avg["avg_buy_price"] = np.where(
+            buy_avg["total_shares"] > 0,
+            buy_avg["weighted"] / buy_avg["total_shares"],
+            np.nan,
+        )
         buy_avg = buy_avg[["ticker", "avg_buy_price"]]
     else:
         buy_avg = pd.DataFrame(columns=["ticker", "avg_buy_price"])
@@ -1171,7 +1308,9 @@ def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) 
     else:
         sold_avg = pd.DataFrame(columns=["ticker", "avg_sold_price"])
 
-    tickers = set(buy_avg.get("ticker", pd.Series(dtype=str)).tolist()) | set(sold_avg.get("ticker", pd.Series(dtype=str)).tolist())
+    tickers = set(buy_avg.get("ticker", pd.Series(dtype=str)).tolist()) | set(
+        sold_avg.get("ticker", pd.Series(dtype=str)).tolist()
+    )
     tx = snap.get("filtered_txns")
     if tx is not None and not tx.empty:
         tx_tickers = tx[tx["type"].isin(["buy", "sell", "short", "cover"])]["ticker"].astype(str).str.upper().str.strip()
@@ -1212,10 +1351,6 @@ def compute_daily_shares_df(
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """
-    Daily NET shares outstanding by ticker from start boundary to end_date.
-    Shorts are negative shares; dividend accrual uses max(shares, 0) (i.e., ignores borrow costs).
-    """
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
     idx = pd.date_range(start=start, end=end, freq="D")
@@ -1289,10 +1424,6 @@ def compute_dividend_accrual_quarterly(
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
 ) -> dict:
-    """
-    Uses yfinance dividend-per-share events and multiplies by LONG shares held on that date.
-    (Short borrow costs / dividend-in-lieu are not modeled.)
-    """
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
@@ -1679,9 +1810,6 @@ if is_admin:
     st.markdown("---")
     st.header("Admin")
 
-    # =========================
-    # Create portfolio (TOP)
-    # =========================
     st.subheader("Create portfolio")
     with st.form("create_portfolio_form", clear_on_submit=True):
         new_name = st.text_input("Name", placeholder="e.g., Long Only, Trading, IRA")
@@ -1719,20 +1847,11 @@ if is_admin:
 
     st.divider()
 
-    # =========================
-    # Active portfolio selector
-    # =========================
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
-    # =========================
-    # Tabs
-    # =========================
     admin_tabs = st.tabs(["Transactions", "Portfolio Settings", "Baseline lots", "Documentation"])
 
-    # -----------------------
-    # Transactions tab
-    # -----------------------
     with admin_tabs[0]:
         st.subheader("Transactions")
 
@@ -1753,11 +1872,8 @@ if is_admin:
         refresh_pressed = False
         add_txn = False
 
-        # -----------------------
-        # Add transaction (manual)
-        # -----------------------
         with st.form("add_txn_form", clear_on_submit=False):
-            txn_type = st.selectbox("Type", ["buy", "sell", "short", "cover", "dividend"], index=0)
+            txn_type = st.selectbox("Type", ["buy", "sell", "short", "cover", "dividend", "credit_interest"], index=0)
             t_date = st.date_input("Date", value=date.today())
 
             if txn_type in ["buy", "sell", "short", "cover"]:
@@ -1788,7 +1904,9 @@ if is_admin:
                 rec = fetch_close_on_or_before(tkr_clean, chosen_date) if tkr_clean else None
 
                 if price_key not in st.session_state:
-                    st.session_state[price_key] = float(rec) if (st.session_state[use_rec_key] and rec is not None) else 100.00
+                    st.session_state[price_key] = (
+                        float(rec) if (st.session_state[use_rec_key] and rec is not None) else 100.00
+                    )
 
                 if st.session_state[use_rec_key] and rec is not None:
                     st.session_state[price_key] = float(rec)
@@ -1809,13 +1927,17 @@ if is_admin:
                     st.caption(f"Recommended close for {tkr_clean} on/before {chosen_date.isoformat()}: **${rec:,.4f}**")
 
             else:
+                st.caption(
+                    "Non-trade cash income rows supported: "
+                    "**dividend** and **credit_interest**. "
+                    "Auto monthly credit_interest is also generated using average SOFR + 0.50% on beginning cash."
+                )
                 c1, c2 = st.columns([1, 1])
                 with c1:
                     t_ticker = st.text_input("Ticker (optional)", value="")
                 with c2:
-                    t_amount = st.number_input(
-                        "Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f"
-                    )
+                    label = "Cash income amount ($)" if txn_type == "credit_interest" else "Dividend amount ($)"
+                    t_amount = st.number_input(label, min_value=0.0, value=0.0, step=1.0, format="%.2f")
 
             add_txn = st.form_submit_button("Save transaction")
 
@@ -1871,9 +1993,6 @@ if is_admin:
                 st.success("Saved.")
                 st.rerun()
 
-        # -----------------------
-        # Bulk upload (beneath Add transaction)
-        # -----------------------
         st.divider()
         st.subheader("Bulk upload (CSV)")
 
@@ -1918,7 +2037,6 @@ Notes:
             size = getattr(f, "size", "unknown")
             return f"{name}::{size}"
 
-        # IMPORTANT: only re-parse + clear previews when the file changes
         if up is not None:
             sig = _file_signature(up)
             prev_sig = st.session_state.get(file_sig_key)
@@ -2001,9 +2119,6 @@ Notes:
         elif up is not None and isinstance(raw_import, pd.DataFrame) and raw_import.empty:
             st.info("No valid buy/sell/short/cover rows found in this file (or required columns missing).")
 
-        # -----------------------
-        # Delete transaction
-        # -----------------------
         st.divider()
         st.subheader("Delete transaction")
 
@@ -2028,7 +2143,9 @@ Notes:
             )
             disp.loc[~trade_mask, "desc"] = (
                 disp.loc[~trade_mask, "date_str"]
-                + " | dividend | "
+                + " | "
+                + disp.loc[~trade_mask, "type"].astype(str)
+                + " | "
                 + disp.loc[~trade_mask, "ticker"].fillna("").astype(str)
                 + " | $"
                 + disp.loc[~trade_mask, "amount"].map(lambda x: f"{x:.2f}")
@@ -2054,9 +2171,6 @@ Notes:
                     st.warning("Deleted.")
                     st.rerun()
 
-    # -----------------------
-    # Portfolio Settings tab
-    # -----------------------
     with admin_tabs[1]:
         st.subheader(f"Portfolio settings: {active}")
 
@@ -2080,9 +2194,6 @@ Notes:
             st.success("Saved.")
             st.rerun()
 
-    # -----------------------
-    # Baseline lots tab
-    # -----------------------
     with admin_tabs[2]:
         st.subheader("Baseline lots (snapshot portfolios only)")
 
@@ -2154,9 +2265,6 @@ Notes:
                     st.warning("Deleted baseline lot.")
                     st.rerun()
 
-    # -----------------------
-    # Documentation tab
-    # -----------------------
     with admin_tabs[3]:
         st.subheader("Documentation")
         st.markdown(
@@ -2166,7 +2274,7 @@ Notes:
 **If you have full history (ledger-complete):**
 1. Go to **Portfolio Settings** → set **Start mode** = `ledger_complete`
 2. Set **Starting cash** (cash at the beginning of your ledger)
-3. Enter **all trades/dividends** in **Transactions**
+3. Enter **all trades/dividends/manual credit_interest** in **Transactions**
 
 **If you only have today's holdings (snapshot-start):**
 1. Go to **Portfolio Settings** → set **Start mode** = `snapshot_start`
@@ -2187,6 +2295,15 @@ Notes:
 - **cover** is only for reducing SHORT shares.
 - This app enforces **no negative cash** (no margin loans). If a transaction would make cash go negative, it is rejected.
 
+### Credit interest
+
+- `credit_interest` is supported as a real cash-income transaction type.
+- The app also auto-generates monthly `credit_interest` for completed months using:
+  - beginning-of-month cash
+  - average monthly SOFR from FRED
+  - plus a fixed annual spread of **0.50%**
+- If a manual `credit_interest` transaction already exists in a month, auto-accrual is skipped for that month.
+
 **Dividends:** estimated dividend accrual is calculated on LONG shares only (does not model borrow costs / dividends-in-lieu on shorts).
 
 ### Bulk upload CSV
@@ -2202,9 +2319,6 @@ Optional:
 """
         )
 
-    # =========================
-    # Backup download
-    # =========================
     st.divider()
     st.subheader("Backup")
     st.caption("Download a ZIP containing: portfolios.csv, transactions.csv, baseline_lots.csv")
