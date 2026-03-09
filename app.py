@@ -1027,13 +1027,23 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def build_contribution_table(snap: dict) -> pd.DataFrame:
-    unreal = pd.DataFrame(columns=["ticker", "unrealized_pnl"])
+    unreal = pd.DataFrame(columns=["ticker", "unrealized_pnl", "unrealized_cost_basis"])
     if not snap["lots"].empty:
-        unreal = snap["lots"].groupby("ticker", as_index=False).agg(unrealized_pnl=("unrealized_pnl", "sum"))
+        u = snap["lots"].copy()
+        u["unrealized_cost_basis"] = u["buy_price"].abs() * u["shares_open"].abs()
+        unreal = u.groupby("ticker", as_index=False).agg(
+            unrealized_pnl=("unrealized_pnl", "sum"),
+            unrealized_cost_basis=("unrealized_cost_basis", "sum"),
+        )
 
-    realized = pd.DataFrame(columns=["ticker", "realized_pnl"])
+    realized = pd.DataFrame(columns=["ticker", "realized_pnl", "realized_cost_basis"])
     if not snap["realized"].empty:
-        realized = snap["realized"].groupby("ticker", as_index=False).agg(realized_pnl=("pnl", "sum"))
+        r = snap["realized"].copy()
+        r["realized_cost_basis"] = r["buy_price"].abs() * r["shares_sold"].abs()
+        realized = r.groupby("ticker", as_index=False).agg(
+            realized_pnl=("pnl", "sum"),
+            realized_cost_basis=("realized_cost_basis", "sum"),
+        )
 
     divs = pd.DataFrame(columns=["ticker", "dividend_pnl"])
     tx = snap["filtered_txns"]
@@ -1049,7 +1059,28 @@ def build_contribution_table(snap: dict) -> pd.DataFrame:
         return out
 
     out = out.fillna(0.0)
+    out["unrealized_return_pct"] = np.where(
+        out["unrealized_cost_basis"] > 0,
+        (out["unrealized_pnl"] / out["unrealized_cost_basis"]) * 100.0,
+        np.nan,
+    )
+    out["realized_return_pct"] = np.where(
+        out["realized_cost_basis"] > 0,
+        (out["realized_pnl"] / out["realized_cost_basis"]) * 100.0,
+        np.nan,
+    )
     out["total_contribution"] = out["unrealized_pnl"] + out["realized_pnl"] + out["dividend_pnl"]
+    out = out[
+        [
+            "ticker",
+            "unrealized_pnl",
+            "unrealized_return_pct",
+            "realized_pnl",
+            "realized_return_pct",
+            "dividend_pnl",
+            "total_contribution",
+        ]
+    ]
     out = out.sort_values("total_contribution", ascending=False).reset_index(drop=True)
     return out
 
@@ -1371,7 +1402,11 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
     if contrib.empty:
         st.info("No contribution data yet (need holdings and/or sells/covers/dividends).")
     else:
-        st.dataframe(contrib, use_container_width=True)
+        show_contrib = contrib.copy()
+        for col in ["unrealized_return_pct", "realized_return_pct"]:
+            show_contrib[col] = pd.to_numeric(show_contrib[col], errors="coerce")
+            show_contrib[col] = show_contrib[col].map(lambda x: f"{x:,.2f}%" if pd.notna(x) else "N/A")
+        st.dataframe(show_contrib, use_container_width=True)
         chart_df = contrib.set_index("ticker")[["total_contribution"]]
         st.bar_chart(chart_df)
 
