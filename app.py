@@ -59,7 +59,7 @@ PORTFOLIO_PATH = "portfolios.csv"
 BASELINE_PATH = "baseline_lots.csv"
 
 TXN_COLS = ["txn_id", "portfolio", "date", "type", "ticker", "shares", "price", "amount"]
-PORTFOLIO_COLS = ["portfolio", "start_mode", "as_of_date", "starting_cash"]
+PORTFOLIO_COLS = ["portfolio", "start_mode", "as_of_date", "starting_cash", "credit_spread_pct"]
 VALID_MODES = ["ledger_complete", "snapshot_start"]
 BASELINE_COLS = ["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shares_open"]
 
@@ -75,7 +75,7 @@ PORTFOLIO_MIN_DATE = date(2000, 1, 1)
 
 # Monthly auto-credit model:
 # interest for a completed month = beginning_of_month_cash * ((avg SOFR + spread) / 100) / 12
-AUTO_CREDIT_SPREAD_PCT = 0.50
+DEFAULT_CREDIT_SPREAD_PCT = 0.50
 SOFR_FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SOFR"
 
 
@@ -102,6 +102,7 @@ def load_portfolios() -> pd.DataFrame:
 
     df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce")
     df["starting_cash"] = pd.to_numeric(df["starting_cash"], errors="coerce").fillna(0.0)
+    df["credit_spread_pct"] = pd.to_numeric(df["credit_spread_pct"], errors="coerce").fillna(DEFAULT_CREDIT_SPREAD_PCT)
 
     if "Main" not in set(df["portfolio"].tolist()):
         df = pd.concat(
@@ -113,6 +114,7 @@ def load_portfolios() -> pd.DataFrame:
                             "start_mode": "ledger_complete",
                             "as_of_date": pd.to_datetime(date.today()),
                             "starting_cash": 0.0,
+                            "credit_spread_pct": DEFAULT_CREDIT_SPREAD_PCT,
                         }
                     ]
                 ),
@@ -134,6 +136,9 @@ def save_portfolios(df: pd.DataFrame) -> None:
     out["as_of_date"] = pd.to_datetime(out["as_of_date"], errors="coerce")
     out.loc[out["as_of_date"].isna(), "as_of_date"] = pd.to_datetime(date.today())
     out["starting_cash"] = pd.to_numeric(out["starting_cash"], errors="coerce").fillna(0.0)
+    out["credit_spread_pct"] = (
+        pd.to_numeric(out["credit_spread_pct"], errors="coerce").fillna(DEFAULT_CREDIT_SPREAD_PCT)
+    )
     out = out[out["portfolio"].notna() & (out["portfolio"] != "")]
     out = out.drop_duplicates(subset=["portfolio"]).sort_values("portfolio")
     out.to_csv(PORTFOLIO_PATH, index=False)
@@ -620,6 +625,7 @@ def get_portfolio_meta(portfolios_df: pd.DataFrame, portfolio: str):
         "start_mode": str(r["start_mode"]),
         "as_of_date": pd.to_datetime(r["as_of_date"]),
         "starting_cash": float(r["starting_cash"]),
+        "credit_spread_pct": float(r.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT)),
     }
 
 
@@ -719,7 +725,8 @@ def build_auto_credit_interest_txns(
         if month not in manual_credit_months and month_start_cash > 1e-12:
             sofr = float(sofr_monthly.get(month, np.nan)) if len(sofr_monthly) else np.nan
             if np.isfinite(sofr):
-                annual_rate = (sofr + AUTO_CREDIT_SPREAD_PCT) / 100.0
+                spread_pct = float(portfolio_meta.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT))
+                annual_rate = (sofr + spread_pct) / 100.0
                 interest_amt = round(month_start_cash * annual_rate / 12.0, 2)
 
                 if interest_amt > 0:
@@ -776,6 +783,32 @@ def build_effective_txns(
     out = out.dropna(subset=["date", "type"]).copy()
     out = out.sort_values(["date", "txn_id"]).reset_index(drop=True)
     return out
+
+
+def build_monthly_credit_income_report(effective_txns: pd.DataFrame) -> pd.DataFrame:
+    if effective_txns is None or effective_txns.empty:
+        return pd.DataFrame(columns=["month", "manual_credit_income", "auto_credit_income", "total_credit_income"])
+
+    tx = effective_txns.copy()
+    tx["date"] = pd.to_datetime(tx["date"], errors="coerce")
+    tx = tx.dropna(subset=["date"])  # defensive
+    tx = tx[tx["type"] == "credit_interest"].copy()
+    if tx.empty:
+        return pd.DataFrame(columns=["month", "manual_credit_income", "auto_credit_income", "total_credit_income"])
+
+    tx["month"] = tx["date"].dt.to_period("M").dt.to_timestamp()
+    tx["amount"] = pd.to_numeric(tx["amount"], errors="coerce").fillna(0.0)
+    tx["source"] = np.where(tx["txn_id"].astype(str).str.startswith("auto_credit_interest__"), "auto", "manual")
+
+    grouped = tx.groupby(["month", "source"], as_index=False)["amount"].sum()
+    pivot = grouped.pivot(index="month", columns="source", values="amount").fillna(0.0)
+    pivot = pivot.rename(columns={"manual": "manual_credit_income", "auto": "auto_credit_income"})
+    for c in ["manual_credit_income", "auto_credit_income"]:
+        if c not in pivot.columns:
+            pivot[c] = 0.0
+    pivot["total_credit_income"] = pivot["manual_credit_income"] + pivot["auto_credit_income"]
+    out = pivot.reset_index().sort_values("month", ascending=False)
+    return out[["month", "manual_credit_income", "auto_credit_income", "total_credit_income"]]
 
 
 def validate_candidate_state(
@@ -1492,6 +1525,7 @@ if not txns_all.empty:
                     "start_mode": "ledger_complete",
                     "as_of_date": pd.to_datetime(date.today()),
                     "starting_cash": 0.0,
+                    "credit_spread_pct": DEFAULT_CREDIT_SPREAD_PCT,
                 }
                 for p in missing
             ]
@@ -1535,6 +1569,7 @@ def render_public_portfolio(
     p_base = baseline_all[baseline_all["portfolio"] == pname].copy()
 
     snap = portfolio_snapshot(meta, p_txns, p_base, match_method, valuation_date=analyze_date)
+    credit_income_report = build_monthly_credit_income_report(snap["filtered_txns"])
 
     if snap["start_mode"] == "snapshot_start":
         st.info(
@@ -1558,6 +1593,15 @@ def render_public_portfolio(
 
     divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(analyze_date))
     st.metric("Dividends (estimated, quarterly accrual)", f"${float(divpack['total']):,.2f}")
+
+    st.markdown("### Monthly credit income")
+    if credit_income_report.empty:
+        st.info("No monthly credit interest income posted yet.")
+    else:
+        show_credit = credit_income_report.copy()
+        show_credit["month"] = pd.to_datetime(show_credit["month"]).dt.strftime("%Y-%m")
+        st.dataframe(show_credit, use_container_width=True)
+        st.bar_chart(credit_income_report.set_index("month")[["total_credit_income"]].sort_index())
 
     st.divider()
     st.markdown("## Tier 1 Analytics")
@@ -1816,6 +1860,7 @@ if is_admin:
         new_mode = st.selectbox("Start mode", VALID_MODES, index=0)
         new_asof = st.date_input("As-of date", value=date.today(), min_value=PORTFOLIO_MIN_DATE)
         new_cash = st.number_input("Starting cash ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
+        new_credit_spread = st.number_input("Credit spread above SOFR (% annual)", value=DEFAULT_CREDIT_SPREAD_PCT, step=0.05, format="%.2f")
         submitted = st.form_submit_button("Add portfolio")
 
     if submitted:
@@ -1835,6 +1880,7 @@ if is_admin:
                                 "start_mode": new_mode,
                                 "as_of_date": pd.to_datetime(new_asof),
                                 "starting_cash": float(new_cash),
+                                "credit_spread_pct": float(new_credit_spread),
                             }
                         ]
                     ),
@@ -1930,7 +1976,7 @@ if is_admin:
                 st.caption(
                     "Non-trade cash income rows supported: "
                     "**dividend** and **credit_interest**. "
-                    "Auto monthly credit_interest is also generated using average SOFR + 0.50% on beginning cash."
+                    "Auto monthly credit_interest is also generated using average SOFR + your configured spread on beginning cash."
                 )
                 c1, c2 = st.columns([1, 1])
                 with c1:
@@ -2184,12 +2230,19 @@ Notes:
                 step=100.0,
                 format="%.2f",
             )
+            spread_u = st.number_input(
+                "Credit spread above SOFR (% annual)",
+                value=float(meta.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT)),
+                step=0.05,
+                format="%.2f",
+            )
             saved = st.form_submit_button("Save settings")
 
         if saved:
             portfolios_df.loc[portfolios_df["portfolio"] == active, "start_mode"] = mode_u
             portfolios_df.loc[portfolios_df["portfolio"] == active, "as_of_date"] = pd.to_datetime(asof_u)
             portfolios_df.loc[portfolios_df["portfolio"] == active, "starting_cash"] = float(cash_u)
+            portfolios_df.loc[portfolios_df["portfolio"] == active, "credit_spread_pct"] = float(spread_u)
             save_portfolios(portfolios_df)
             st.success("Saved.")
             st.rerun()
@@ -2301,7 +2354,7 @@ Notes:
 - The app also auto-generates monthly `credit_interest` for completed months using:
   - beginning-of-month cash
   - average monthly SOFR from FRED
-  - plus a fixed annual spread of **0.50%**
+  - plus a configurable annual spread (default **0.50%**) set in Portfolio Settings
 - If a manual `credit_interest` transaction already exists in a month, auto-accrual is skipped for that month.
 
 **Dividends:** estimated dividend accrual is calculated on LONG shares only (does not model borrow costs / dividends-in-lieu on shorts).
