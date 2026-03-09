@@ -645,33 +645,59 @@ def _cash_start_boundary(meta: dict, txns: pd.DataFrame) -> pd.Timestamp:
     return min(as_of, d.min().normalize())
 
 
-@st.cache_data(ttl=86400)
-def fetch_sofr_monthly_avg(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.Series:
-    start = pd.to_datetime(start_date).normalize()
-    end = pd.to_datetime(end_date).normalize()
-
-    if end < start:
-        return pd.Series(dtype=float)
-
+@st.cache_data(ttl=3600)
+def fetch_latest_irx_rate_pct() -> float | None:
     try:
-        raw = pd.read_csv(SOFR_FRED_CSV_URL)
-        raw.columns = [str(c).strip().upper() for c in raw.columns]
-        if "DATE" not in raw.columns or "SOFR" not in raw.columns:
-            return pd.Series(dtype=float)
+        data = yf.download(IRX_PROXY_TICKER, period="5d", interval="1d", auto_adjust=False, progress=False)
+        if data is None or data.empty:
+            return None
 
-        raw["DATE"] = pd.to_datetime(raw["DATE"], errors="coerce")
-        raw["SOFR"] = pd.to_numeric(raw["SOFR"], errors="coerce")
-        raw = raw.dropna(subset=["DATE", "SOFR"]).copy()
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            if IRX_PROXY_TICKER not in close.columns:
+                return None
+            s = close[IRX_PROXY_TICKER]
+        else:
+            s = close
 
-        raw = raw[(raw["DATE"] >= start) & (raw["DATE"] <= end)].copy()
-        if raw.empty:
-            return pd.Series(dtype=float)
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            return None
 
-        raw["MONTH"] = raw["DATE"].dt.to_period("M")
-        monthly = raw.groupby("MONTH")["SOFR"].mean().sort_index()
-        return monthly.astype(float)
+        return float(s.iloc[-1])
     except Exception:
-        return pd.Series(dtype=float)
+        return None
+
+
+def estimate_credit_interest(cash_balance: float) -> float:
+    try:
+        cash = float(cash_balance)
+    except Exception:
+        print("Could not estimate credit interest: invalid cash balance.")
+        return 0.0
+
+    if cash <= 0:
+        print("Could not estimate credit interest: cash balance must be positive.")
+        return 0.0
+
+    irx_rate_pct = fetch_latest_irx_rate_pct()
+    if irx_rate_pct is None or not np.isfinite(irx_rate_pct):
+        print("Could not estimate credit interest: failed to fetch latest ^IRX rate.")
+        return 0.0
+
+    irx_decimal = irx_rate_pct / 100.0
+    wf_rate_decimal = max(irx_decimal - (WF_SPREAD_ADJUSTMENT_PCT / 100.0), 0.0)
+    monthly_rate = wf_rate_decimal / 12.0
+    est_interest = cash * monthly_rate
+
+    print(
+        "Credit Interest Estimate | "
+        f"^IRX: {irx_rate_pct:.4f}% | "
+        f"Implied WF Rate: {wf_rate_decimal * 100.0:.4f}% | "
+        f"Estimated Monthly Interest: ${est_interest:,.2f}"
+    )
+
+    return float(est_interest)
 
 
 def build_auto_credit_interest_txns(
@@ -703,7 +729,6 @@ def build_auto_credit_interest_txns(
     if not months:
         return pd.DataFrame(columns=TXN_COLS)
 
-    sofr_monthly = fetch_sofr_monthly_avg(start_boundary, eval_date)
 
     if txns.empty:
         work = pd.DataFrame(columns=TXN_COLS + ["month"])
