@@ -486,6 +486,65 @@ def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd
     return good, bad
 
 
+def parse_credit_interest_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Required columns:
+      MONTH | AMOUNT
+
+    Optional columns:
+      TICKER
+
+    Returns (good, bad):
+      good columns: date, amount, ticker
+      bad includes original values + reason
+    """
+    df = pd.read_csv(uploaded_file)
+    df.columns = [str(c).strip().upper() for c in df.columns]
+
+    required = ["MONTH", "AMOUNT"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    work = pd.DataFrame()
+    work["month_raw"] = df["MONTH"].astype(str).str.strip()
+    work["amount_raw"] = df["AMOUNT"]
+    work["ticker"] = (
+        df["TICKER"].astype(str).str.upper().str.strip() if "TICKER" in df.columns else ""
+    )
+
+    month_str = work["month_raw"].astype(str).str.replace(r"[/.]", "-", regex=True)
+    parsed_month = pd.to_datetime(month_str, errors="coerce")
+    month_is_yyyy_mm = month_str.str.match(r"^\d{4}-\d{2}$")
+    parsed_month = parsed_month.where(~month_is_yyyy_mm, pd.to_datetime(month_str + "-01", errors="coerce"))
+
+    work["date"] = parsed_month.dt.to_period("M").dt.to_timestamp()
+    work["amount"] = pd.to_numeric(work["amount_raw"].apply(_parse_number_allow_parens), errors="coerce")
+
+    bad_reasons = []
+    for _, r in work.iterrows():
+        if pd.isna(r["date"]):
+            bad_reasons.append("Invalid MONTH (use YYYY-MM)")
+        elif pd.isna(r["amount"]):
+            bad_reasons.append("Invalid AMOUNT")
+        elif float(r["amount"]) < 0:
+            bad_reasons.append("AMOUNT must be >= 0")
+        else:
+            bad_reasons.append("")
+
+    work["reason"] = bad_reasons
+    good = work.loc[work["reason"] == "", ["date", "amount", "ticker"]].copy()
+    bad = work.loc[work["reason"] != "", ["month_raw", "amount_raw", "ticker", "reason"]].copy()
+    bad = bad.rename(columns={"month_raw": "MONTH", "amount_raw": "AMOUNT", "ticker": "TICKER"})
+
+    good["amount"] = pd.to_numeric(good["amount"], errors="coerce")
+    good["ticker"] = good["ticker"].fillna("").astype(str)
+    good = good.dropna(subset=["date", "amount"])
+    good = good[good["amount"] >= 0].reset_index(drop=True)
+    bad = bad.reset_index(drop=True)
+    return good, bad
+
+
 # =========================
 # 3) Lot engine + accounting (LONG + SHORT)
 # =========================
@@ -2177,6 +2236,113 @@ Notes:
             st.info("No valid buy/sell/short/cover rows found in this file (or required columns missing).")
 
         st.divider()
+        st.subheader("Monthly credit_interest upload (CSV)")
+        credit_up = st.file_uploader(
+            "Upload monthly credit_interest CSV",
+            type=["csv"],
+            key=f"credit_upload_csv__{active}",
+            help="""
+Required CSV headers (exact):
+
+MONTH | AMOUNT
+
+Optional:
+TICKER
+
+Examples:
+• MONTH: 2024-01
+• AMOUNT: 125.50
+• TICKER (optional): CASH
+
+Notes:
+• This uploader is only for monthly credit_interest rows.
+• MONTH is saved as the first day of the month.
+• Import can Append or Replace existing credit_interest rows for this portfolio.
+""",
+        )
+
+        credit_mode = st.radio(
+            "Credit interest import mode",
+            ["Append", "Replace credit_interest"],
+            horizontal=True,
+            key=f"credit_mode__{active}",
+        )
+
+        credit_good_key = f"credit_good__{active}"
+        credit_bad_key = f"credit_bad__{active}"
+        credit_file_sig_key = f"credit_file_sig__{active}"
+
+        if credit_up is not None:
+            credit_sig = _file_signature(credit_up)
+            prev_credit_sig = st.session_state.get(credit_file_sig_key)
+            if credit_sig != prev_credit_sig:
+                st.session_state[credit_file_sig_key] = credit_sig
+                try:
+                    credit_good, credit_bad = parse_credit_interest_csv(credit_up)
+                    st.session_state[credit_good_key] = credit_good
+                    st.session_state[credit_bad_key] = credit_bad
+                except Exception as e:
+                    st.error(f"Credit-interest upload failed: {e}")
+                    st.session_state[credit_good_key] = pd.DataFrame()
+                    st.session_state[credit_bad_key] = pd.DataFrame()
+
+        credit_good = st.session_state.get(credit_good_key, pd.DataFrame())
+        credit_bad = st.session_state.get(credit_bad_key, pd.DataFrame())
+
+        if isinstance(credit_bad, pd.DataFrame) and not credit_bad.empty:
+            st.warning(f"Skipped credit_interest rows: {len(credit_bad)}")
+            st.dataframe(credit_bad, use_container_width=True)
+
+        if isinstance(credit_good, pd.DataFrame) and not credit_good.empty:
+            st.success(f"Ready to import credit_interest rows: {len(credit_good)}")
+
+            credit_preview = credit_good.copy()
+            credit_preview["date"] = pd.to_datetime(credit_preview["date"]).dt.date.astype(str)
+            st.dataframe(credit_preview, use_container_width=True)
+
+            if st.button("✅ Import monthly credit_interest", type="primary", key=f"credit_import_btn__{active}"):
+                rows = []
+                base_id = pd.Timestamp.utcnow().value
+                for i, r in credit_good.reset_index(drop=True).iterrows():
+                    rows.append(
+                        {
+                            "txn_id": str(base_id + i),
+                            "portfolio": active,
+                            "date": pd.to_datetime(r["date"]),
+                            "type": "credit_interest",
+                            "ticker": str(r.get("ticker", "")).upper().strip(),
+                            "shares": np.nan,
+                            "price": np.nan,
+                            "amount": float(r["amount"]),
+                        }
+                    )
+
+                credit_import_df = pd.DataFrame(rows)
+                if credit_mode == "Replace credit_interest":
+                    keep = txns_all[~((txns_all["portfolio"] == active) & (txns_all["type"] == "credit_interest"))].copy()
+                    candidate_txns = pd.concat([keep, credit_import_df], ignore_index=True)
+                else:
+                    candidate_txns = pd.concat([txns_all, credit_import_df], ignore_index=True)
+
+                p_txns2 = candidate_txns[candidate_txns["portfolio"] == active].copy()
+                p_base2 = baseline_all[baseline_all["portfolio"] == active].copy()
+
+                ok, msg = validate_candidate_state(meta, p_txns2, p_base2, match_method)
+                if not ok:
+                    st.error(f"Credit-interest import rejected: {msg}")
+                else:
+                    txns_all = candidate_txns
+                    save_txns(txns_all)
+                    st.success(
+                        f"Imported {len(credit_import_df)} credit_interest rows into '{active}' ({credit_mode})."
+                    )
+                    st.session_state.pop(credit_good_key, None)
+                    st.session_state.pop(credit_bad_key, None)
+                    st.rerun()
+        elif credit_up is not None:
+            st.info("No valid monthly credit_interest rows found in this file.")
+
+        st.divider()
         st.subheader("Delete transaction")
 
         p_txns = txns_all[txns_all["portfolio"] == active].copy()
@@ -2380,6 +2546,19 @@ Required headers:
 
 Optional:
 - PRICE  (if blank/missing, we fetch Yahoo close on/before DATE)
+
+### Monthly credit interest CSV upload
+
+Use the dedicated uploader in **Transactions** for manual monthly credit interest.
+
+Required headers:
+- MONTH (e.g. `2024-01`)
+- AMOUNT
+
+Optional:
+- TICKER
+
+This creates `credit_interest` transactions dated on the first day of each month.
 """
         )
 
