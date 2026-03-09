@@ -1054,6 +1054,75 @@ def build_contribution_table(snap: dict) -> pd.DataFrame:
     return out
 
 
+def build_price_breakdown_table(snap: dict) -> pd.DataFrame:
+    entry_rows = []
+
+    if snap.get("lots") is not None and not snap["lots"].empty:
+        l = snap["lots"][["ticker", "buy_price", "shares_open"]].copy()
+        l["shares_ref"] = l["shares_open"].abs()
+        l = l[l["shares_ref"] > 0]
+        if not l.empty:
+            entry_rows.append(l[["ticker", "buy_price", "shares_ref"]].rename(columns={"buy_price": "entry_price"}))
+
+    if snap.get("realized") is not None and not snap["realized"].empty:
+        r = snap["realized"][["ticker", "buy_price", "shares_sold", "sell_price"]].copy()
+        r["shares_ref"] = pd.to_numeric(r["shares_sold"], errors="coerce").fillna(0.0).abs()
+        r = r[r["shares_ref"] > 0]
+        if not r.empty:
+            entry_rows.append(r[["ticker", "buy_price", "shares_ref"]].rename(columns={"buy_price": "entry_price"}))
+
+    if entry_rows:
+        entry = pd.concat(entry_rows, ignore_index=True)
+        entry["weighted"] = entry["entry_price"] * entry["shares_ref"]
+        buy_avg = (
+            entry.groupby("ticker", as_index=False)
+            .agg(total_shares=("shares_ref", "sum"), weighted=("weighted", "sum"))
+        )
+        buy_avg["avg_buy_price"] = np.where(buy_avg["total_shares"] > 0, buy_avg["weighted"] / buy_avg["total_shares"], np.nan)
+        buy_avg = buy_avg[["ticker", "avg_buy_price"]]
+    else:
+        buy_avg = pd.DataFrame(columns=["ticker", "avg_buy_price"])
+
+    if snap.get("realized") is not None and not snap["realized"].empty:
+        sold = snap["realized"][["ticker", "sell_price", "shares_sold"]].copy()
+        sold["shares_ref"] = pd.to_numeric(sold["shares_sold"], errors="coerce").fillna(0.0).abs()
+        sold = sold[sold["shares_ref"] > 0]
+        if not sold.empty:
+            sold["weighted"] = sold["sell_price"] * sold["shares_ref"]
+            sold_avg = (
+                sold.groupby("ticker", as_index=False)
+                .agg(total_shares=("shares_ref", "sum"), weighted=("weighted", "sum"))
+            )
+            sold_avg["avg_sold_price"] = np.where(
+                sold_avg["total_shares"] > 0,
+                sold_avg["weighted"] / sold_avg["total_shares"],
+                np.nan,
+            )
+            sold_avg = sold_avg[["ticker", "avg_sold_price"]]
+        else:
+            sold_avg = pd.DataFrame(columns=["ticker", "avg_sold_price"])
+    else:
+        sold_avg = pd.DataFrame(columns=["ticker", "avg_sold_price"])
+
+    tickers = set(buy_avg.get("ticker", pd.Series(dtype=str)).tolist()) | set(sold_avg.get("ticker", pd.Series(dtype=str)).tolist())
+    tx = snap.get("filtered_txns")
+    if tx is not None and not tx.empty:
+        tx_tickers = tx[tx["type"].isin(["buy", "sell", "short", "cover"])]["ticker"].astype(str).str.upper().str.strip()
+        tickers |= set([t for t in tx_tickers.tolist() if t])
+
+    tickers = sorted(tickers)
+    if not tickers:
+        return pd.DataFrame(columns=["ticker", "avg_buy_price", "avg_sold_price", "current_price"])
+
+    out = pd.DataFrame({"ticker": tickers})
+    out = out.merge(buy_avg, on="ticker", how="left").merge(sold_avg, on="ticker", how="left")
+
+    live = fetch_last_prices(tickers)
+    out["current_price"] = out["ticker"].map(live)
+
+    return out.sort_values("ticker").reset_index(drop=True)
+
+
 def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
     if sector_alloc.empty or sector_alloc["exposure"].sum() <= 0:
         st.info("No sector allocation available yet.")
@@ -1305,6 +1374,17 @@ def render_public_portfolio(pname: str, nav_series: pd.Series | None = None, spy
         st.dataframe(contrib, use_container_width=True)
         chart_df = contrib.set_index("ticker")[["total_contribution"]]
         st.bar_chart(chart_df)
+
+    st.markdown("### Contribution to return — price breakdown by ticker")
+    px_breakdown = build_price_breakdown_table(snap)
+    if px_breakdown.empty:
+        st.info("No price breakdown available yet (need holdings and/or closed trades).")
+    else:
+        show_px = px_breakdown.copy()
+        for col in ["avg_buy_price", "avg_sold_price", "current_price"]:
+            show_px[col] = pd.to_numeric(show_px[col], errors="coerce")
+            show_px[col] = show_px[col].map(lambda x: f"${x:,.4f}" if pd.notna(x) else "N/A")
+        st.dataframe(show_px, use_container_width=True)
 
     st.markdown("### Dividend tracker (estimated)")
     if divpack["quarterly"] is None or divpack["quarterly"].empty:
@@ -1606,8 +1686,8 @@ if is_admin:
                         "Shares",
                         min_value=0.0,
                         value=1.000,
-                        step=0.001,
-                        format="%.3f",
+                        step=0.0001,
+                        format="%.4f",
                         key=shares_key,
                     )
 
@@ -1633,15 +1713,15 @@ if is_admin:
                         "Price",
                         min_value=0.0,
                         value=float(st.session_state[price_key]),
-                        step=0.01,
-                        format="%.2f",
+                        step=0.0001,
+                        format="%.4f",
                         key=price_key,
                         help="Auto-fills with close on/before the transaction date (editable).",
                     )
                     refresh_pressed = st.form_submit_button("🔄 Refresh price")
 
                 if rec is not None and tkr_clean:
-                    st.caption(f"Recommended close for {tkr_clean} on/before {chosen_date.isoformat()}: **${rec:,.2f}**")
+                    st.caption(f"Recommended close for {tkr_clean} on/before {chosen_date.isoformat()}: **${rec:,.4f}**")
 
             else:
                 c1, c2 = st.columns([1, 1])
@@ -1688,7 +1768,7 @@ if is_admin:
                 "date": pd.to_datetime(t_date),
                 "type": txn_type_now,
                 "ticker": t_ticker_final,
-                "shares": float(round(t_shares_final, 3)) if pd.notna(t_shares_final) else np.nan,
+                "shares": float(round(t_shares_final, 4)) if pd.notna(t_shares_final) else np.nan,
                 "price": float(t_price_final) if pd.notna(t_price_final) else np.nan,
                 "amount": float(t_amount_final) if pd.notna(t_amount_final) else np.nan,
             }
