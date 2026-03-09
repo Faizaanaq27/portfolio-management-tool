@@ -1603,6 +1603,28 @@ portfolio_names = portfolios_df["portfolio"].tolist()
 # =========================
 st.title("Brown Investment Group Portfolio")
 st.caption("Public view is read-only. Admin can edit portfolios, baseline lots, and transactions.")
+st.markdown(
+    """
+    <style>
+        .review-box {
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 0.75rem;
+            padding: 0.9rem 1rem;
+            background: rgba(240, 242, 246, 0.45);
+            margin-bottom: 0.8rem;
+        }
+        .review-box h4 {
+            margin: 0 0 0.4rem 0;
+            font-size: 1rem;
+        }
+        .review-box ul {
+            margin: 0;
+            padding-left: 1.1rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.sidebar.header("Settings")
 analyze_on_date = st.sidebar.date_input(
@@ -1642,6 +1664,21 @@ def render_public_portfolio(
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
 
+    st.markdown(
+        """
+        <div class="review-box">
+            <h4>How to review this portfolio</h4>
+            <ul>
+                <li><b>Health:</b> Start with NAV, cash, and market value to understand size and liquidity.</li>
+                <li><b>Performance:</b> Use P&amp;L, drawdown, and relative growth to judge outcomes over time.</li>
+                <li><b>Drivers:</b> Review sector allocation and ticker contribution to see what is helping or hurting.</li>
+                <li><b>Risk:</b> Check beta/alpha vs SPY and concentration in holdings/lots.</li>
+            </ul>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.caption(f"Analysis date: **{pd.to_datetime(analyze_date).date().isoformat()}**")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1657,119 +1694,122 @@ def render_public_portfolio(
     divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(analyze_date))
     st.metric("Dividends (estimated, quarterly accrual)", f"${float(divpack['total']):,.2f}")
 
-    st.markdown("### Monthly credit income")
-    if credit_income_report.empty:
-        st.info("No monthly credit interest income posted yet.")
-    else:
-        show_credit = credit_income_report.copy()
-        show_credit["month"] = pd.to_datetime(show_credit["month"]).dt.strftime("%Y-%m")
-        st.dataframe(show_credit, use_container_width=True)
-        chart_credit = credit_income_report.copy()
-        chart_credit["month"] = pd.to_datetime(chart_credit["month"])
-        st.bar_chart(chart_credit.set_index("month")[["total_credit_income"]].sort_index())
+    section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Position Details"])
 
-    st.divider()
-    st.markdown("## Tier 1 Analytics")
+    with section_tabs[0]:
+        st.markdown("### Drawdown")
+        if nav_series is None or nav_series.dropna().empty:
+            st.info("No NAV series yet for drawdown.")
+        else:
+            dd = compute_drawdown(nav_series)
+            st.line_chart(dd)
 
-    sector_alloc, industry_alloc = build_allocation_tables(snap)
-    a1, a2 = st.columns([1, 1])
-    with a1:
-        st.markdown("### Sector allocation (ABS exposure incl. cash)")
-        render_sector_pie(sector_alloc, f"{pname} — Sector Exposure (Abs)")
-        st.dataframe(
-            sector_alloc.assign(weight_pct=(sector_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
-            use_container_width=True,
-        )
-    with a2:
-        st.markdown("### Sector → Industry breakdown (ABS exposure, Yahoo Finance)")
-        st.dataframe(
-            industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
-            use_container_width=True,
-        )
+    with section_tabs[1]:
+        sector_alloc, industry_alloc = build_allocation_tables(snap)
+        a1, a2 = st.columns([1, 1])
+        with a1:
+            st.markdown("### Sector allocation (ABS exposure incl. cash)")
+            render_sector_pie(sector_alloc, f"{pname} — Sector Exposure (Abs)")
+            st.dataframe(
+                sector_alloc.assign(weight_pct=(sector_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
+                use_container_width=True,
+            )
+        with a2:
+            st.markdown("### Sector → Industry breakdown (ABS exposure, Yahoo Finance)")
+            st.dataframe(
+                industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
+                use_container_width=True,
+            )
 
-    st.markdown("### Contribution to return (P&L contribution by ticker)")
-    contrib = build_contribution_table(snap)
-    if contrib.empty:
-        st.info("No contribution data yet (need holdings and/or sells/covers/dividends).")
-    else:
-        show_contrib = contrib.copy()
-        for col in ["unrealized_return_pct", "realized_return_pct"]:
-            show_contrib[col] = pd.to_numeric(show_contrib[col], errors="coerce")
-            show_contrib[col] = show_contrib[col].map(lambda x: f"{x:,.2f}%" if pd.notna(x) else "N/A")
-        st.dataframe(show_contrib, use_container_width=True)
-        chart_df = contrib.set_index("ticker")[["total_contribution"]]
-        st.bar_chart(chart_df)
+        st.markdown("### Contribution to return (P&L contribution by ticker)")
+        contrib = build_contribution_table(snap)
+        if contrib.empty:
+            st.info("No contribution data yet (need holdings and/or sells/covers/dividends).")
+        else:
+            show_contrib = contrib.copy()
+            for col in ["unrealized_return_pct", "realized_return_pct"]:
+                show_contrib[col] = pd.to_numeric(show_contrib[col], errors="coerce")
+                show_contrib[col] = show_contrib[col].map(lambda x: f"{x:,.2f}%" if pd.notna(x) else "N/A")
+            st.dataframe(show_contrib, use_container_width=True)
+            chart_df = contrib.set_index("ticker")[["total_contribution"]]
+            st.bar_chart(chart_df)
 
-    st.markdown("### Contribution to return — price breakdown by ticker")
-    px_breakdown = build_price_breakdown_table(snap, valuation_date=analyze_date)
-    if px_breakdown.empty:
-        st.info("No price breakdown available yet (need holdings and/or closed trades).")
-    else:
-        show_px = px_breakdown.copy()
-        for col in ["avg_buy_price", "avg_sold_price", "current_price"]:
-            show_px[col] = pd.to_numeric(show_px[col], errors="coerce")
-            show_px[col] = show_px[col].map(lambda x: f"${x:,.4f}" if pd.notna(x) else "N/A")
-        st.dataframe(show_px, use_container_width=True)
+        st.markdown("### Contribution to return — price breakdown by ticker")
+        px_breakdown = build_price_breakdown_table(snap, valuation_date=analyze_date)
+        if px_breakdown.empty:
+            st.info("No price breakdown available yet (need holdings and/or closed trades).")
+        else:
+            show_px = px_breakdown.copy()
+            for col in ["avg_buy_price", "avg_sold_price", "current_price"]:
+                show_px[col] = pd.to_numeric(show_px[col], errors="coerce")
+                show_px[col] = show_px[col].map(lambda x: f"${x:,.4f}" if pd.notna(x) else "N/A")
+            st.dataframe(show_px, use_container_width=True)
 
-    st.markdown("### Dividend tracker (estimated)")
-    if divpack["quarterly"] is None or divpack["quarterly"].empty:
-        st.info("No dividend events found for held LONG tickers in this period.")
-    else:
-        st.dataframe(divpack["quarterly"], use_container_width=True)
-        st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
+    with section_tabs[2]:
+        st.markdown("### Monthly credit income")
+        if credit_income_report.empty:
+            st.info("No monthly credit interest income posted yet.")
+        else:
+            show_credit = credit_income_report.copy()
+            show_credit["month"] = pd.to_datetime(show_credit["month"]).dt.strftime("%Y-%m")
+            st.dataframe(show_credit, use_container_width=True)
+            chart_credit = credit_income_report.copy()
+            chart_credit["month"] = pd.to_datetime(chart_credit["month"])
+            st.bar_chart(chart_credit.set_index("month")[["total_credit_income"]].sort_index())
 
-    st.markdown("### Drawdown")
-    if nav_series is None or nav_series.dropna().empty:
-        st.info("No NAV series yet for drawdown.")
-    else:
-        dd = compute_drawdown(nav_series)
-        st.line_chart(dd)
+        st.markdown("### Dividend tracker (estimated)")
+        if divpack["quarterly"] is None or divpack["quarterly"].empty:
+            st.info("No dividend events found for held LONG tickers in this period.")
+        else:
+            st.dataframe(divpack["quarterly"], use_container_width=True)
+            st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
 
-    st.markdown("### Beta / Alpha vs SPY")
-    if nav_series is None or spy_px is None or nav_series.dropna().empty or spy_px.dropna().empty:
-        st.info("Beta/alpha need both portfolio NAV series and benchmark series.")
-    else:
-        stats = compute_beta_alpha(nav_series, spy_px)
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Beta", f"{stats['beta']:.2f}" if np.isfinite(stats["beta"]) else "—")
-        k2.metric("Alpha (annualized)", f"{stats['alpha_ann']*100:.2f}%" if np.isfinite(stats["alpha_ann"]) else "—")
-        k3.metric("R²", f"{stats['r2']:.2f}" if np.isfinite(stats["r2"]) else "—")
-        k4.metric("Obs", f"{stats['n']}")
+    with section_tabs[3]:
+        st.markdown("### Beta / Alpha vs SPY")
+        if nav_series is None or spy_px is None or nav_series.dropna().empty or spy_px.dropna().empty:
+            st.info("Beta/alpha need both portfolio NAV series and benchmark series.")
+        else:
+            stats = compute_beta_alpha(nav_series, spy_px)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Beta", f"{stats['beta']:.2f}" if np.isfinite(stats["beta"]) else "—")
+            k2.metric("Alpha (annualized)", f"{stats['alpha_ann']*100:.2f}%" if np.isfinite(stats["alpha_ann"]) else "—")
+            k3.metric("R²", f"{stats['r2']:.2f}" if np.isfinite(stats["r2"]) else "—")
+            k4.metric("Obs", f"{stats['n']}")
 
-        roll = rolling_beta_alpha(nav_series, spy_px, window=26)
-        if not roll.empty:
-            r1, r2 = st.columns(2)
-            with r1:
-                st.caption("Rolling beta (26 periods)")
-                st.line_chart(roll[["beta"]])
-            with r2:
-                st.caption("Rolling alpha (annualized, 26 periods)")
-                st.line_chart(roll[["alpha_ann"]])
+            roll = rolling_beta_alpha(nav_series, spy_px, window=26)
+            if not roll.empty:
+                r1, r2 = st.columns(2)
+                with r1:
+                    st.caption("Rolling beta (26 periods)")
+                    st.line_chart(roll[["beta"]])
+                with r2:
+                    st.caption("Rolling alpha (annualized, 26 periods)")
+                    st.line_chart(roll[["alpha_ann"]])
 
-    st.divider()
-    if not snap["holdings"].empty:
-        st.markdown("### Holdings (net shares can be negative for shorts)")
-        st.dataframe(snap["holdings"], use_container_width=True)
+    with section_tabs[4]:
+        if not snap["holdings"].empty:
+            st.markdown("### Holdings (net shares can be negative for shorts)")
+            st.dataframe(snap["holdings"], use_container_width=True)
 
-    if not snap["lots"].empty:
-        st.markdown("### Open lots (baseline + trades) — LONG & SHORT")
-        st.dataframe(snap["lots"].sort_values(["ticker", "buy_date"]), use_container_width=True)
+        if not snap["lots"].empty:
+            st.markdown("### Open lots (baseline + trades) — LONG & SHORT")
+            st.dataframe(snap["lots"].sort_values(["ticker", "buy_date"]), use_container_width=True)
 
-    if not snap["realized"].empty:
-        rv = snap["realized"].copy()
-        rv["realized_return_%"] = np.where(
-            rv["buy_price"] > 0,
-            ((rv["sell_price"] / rv["buy_price"]) - 1.0) * 100.0,
-            np.nan,
-        )
-        st.markdown("### Realized matches (per lot) — sells & covers")
-        st.dataframe(rv.sort_values(["sell_date", "ticker"], ascending=False), use_container_width=True)
+        if not snap["realized"].empty:
+            rv = snap["realized"].copy()
+            rv["realized_return_%"] = np.where(
+                rv["buy_price"] > 0,
+                ((rv["sell_price"] / rv["buy_price"]) - 1.0) * 100.0,
+                np.nan,
+            )
+            st.markdown("### Realized matches (per lot) — sells & covers")
+            st.dataframe(rv.sort_values(["sell_date", "ticker"], ascending=False), use_container_width=True)
 
-    st.markdown("### Transactions (filtered by boundary when snapshot)")
-    if snap["filtered_txns"].empty:
-        st.write("No transactions.")
-    else:
-        st.dataframe(snap["filtered_txns"], use_container_width=True)
+        st.markdown("### Transactions (filtered by boundary when snapshot)")
+        if snap["filtered_txns"].empty:
+            st.write("No transactions.")
+        else:
+            st.dataframe(snap["filtered_txns"], use_container_width=True)
 
 
 # ----------------------------
