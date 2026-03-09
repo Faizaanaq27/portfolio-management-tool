@@ -742,6 +742,7 @@ def build_auto_credit_interest_txns(
 
     running_cash = float(portfolio_meta["starting_cash"])
     auto_rows = []
+    irx_rate_pct = fetch_latest_irx_rate_pct()
 
     for month in months:
         month_txns = work[work["month"] == month].sort_values(["date", "txn_id"]) if not work.empty else pd.DataFrame()
