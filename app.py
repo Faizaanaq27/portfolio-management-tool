@@ -1328,6 +1328,7 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df.loc[df["label"] == "CASH", "industry"] = "Cash"
     df["sector"] = df["sector"].fillna("Unknown")
     df["industry"] = df["industry"].fillna("Unknown")
+    df["ticker_display"] = np.where(df["label"] == "CASH", "CASH", df["ticker"])
     df["sector_bucket"] = [classify_sector_bucket(s, i) for s, i in zip(df["sector"], df["industry"]) ]
     df.loc[df["label"] == "CASH", "sector_bucket"] = "Cash"
 
@@ -1342,7 +1343,13 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     industry_alloc = (
         df.groupby(["sector_bucket", "industry"], as_index=False)
-        .agg(exposure=("exposure", "sum"))
+        .agg(
+            exposure=("exposure", "sum"),
+            tickers=(
+                "ticker_display",
+                lambda s: ", ".join(sorted({str(t).strip() for t in s if str(t).strip()})),
+            ),
+        )
         .rename(columns={"sector_bucket": "sector"})
         .sort_values(["sector", "exposure"], ascending=[True, False])
     )
@@ -1501,7 +1508,8 @@ def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
         labeldistance=1.14,
         textprops={"fontsize": 9},
     )
-    ax.set_title(title)
+    ax.set_title(title, pad=24)
+    fig.subplots_adjust(top=0.80)
     ax.axis("equal")
     st.pyplot(fig, clear_figure=True)
 
@@ -1828,7 +1836,7 @@ def render_public_portfolio(
                 use_container_width=True,
             )
         with a2:
-            st.markdown("### Sector → Industry breakdown (ABS exposure, Yahoo Finance)")
+            st.markdown("### Sector → Industry breakdown (ABS exposure)")
             st.dataframe(
                 industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
                 use_container_width=True,
