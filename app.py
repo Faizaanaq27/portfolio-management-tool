@@ -5,6 +5,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import altair as alt
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -1679,15 +1680,79 @@ def render_public_portfolio(
         unsafe_allow_html=True,
     )
 
+    def _period_return(nav_s: pd.Series | None, lookback_days: int | None = None) -> float:
+        if nav_s is None:
+            return np.nan
+        s = nav_s.dropna().sort_index()
+        if s.empty:
+            return np.nan
+
+        end_val = float(s.iloc[-1])
+        if abs(end_val) < 1e-12:
+            return np.nan
+
+        if lookback_days is None:
+            start_val = float(s.iloc[0])
+        else:
+            cutoff = s.index.max() - pd.Timedelta(days=lookback_days)
+            hist = s[s.index <= cutoff]
+            if hist.empty:
+                return np.nan
+            start_val = float(hist.iloc[-1])
+
+        if abs(start_val) < 1e-12:
+            return np.nan
+        return (end_val / start_val) - 1.0
+
     st.caption(f"Analysis date: **{pd.to_datetime(analyze_date).date().isoformat()}**")
 
     credit_income_total = float(credit_income_report["total_credit_income"].sum()) if not credit_income_report.empty else 0.0
     divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(analyze_date))
-    st.metric("Dividends (estimated, quarterly accrual)", f"${float(divpack['total']):,.2f}")
+
+    total_return = _period_return(nav_series, None)
+    one_year_return = _period_return(nav_series, 365)
+    quarterly_return = _period_return(nav_series, 90)
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("NAV", f"${float(snap['nav']):,.2f}")
+    k2.metric("Market Value", f"${float(snap['market_value']):,.2f}")
+    k3.metric("Cash", f"${float(snap['cash']):,.2f}")
+
+    k4, k5, k6, k7 = st.columns(4)
+    k4.metric("Unrealized Gain", f"${float(snap['unrealized_pnl']):,.2f}")
+    k5.metric("Realized Gain", f"${float(snap['realized_pnl']):,.2f}")
+    k6.metric("Dividends", f"${float(divpack['total']):,.2f}")
+    k7.metric("Credit Income", f"${credit_income_total:,.2f}")
+
+    k8, k9, k10 = st.columns(3)
+    k8.metric(
+        "Total Return since inception",
+        f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A",
+    )
+    k9.metric("1 yr Return", f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A")
+    k10.metric("Quarterly return", f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A")
 
     section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Position Details"])
 
     with section_tabs[0]:
+        st.markdown("### All-time performance (NAV)")
+        if nav_series is None or nav_series.dropna().empty:
+            st.info("No NAV series yet for performance.")
+        else:
+            perf_nav = nav_series.dropna().sort_index().to_frame(name="NAV")
+            perf_nav = perf_nav.reset_index()
+            perf_nav = perf_nav.rename(columns={perf_nav.columns[0]: "Date"})
+            y_start = float(perf_nav["NAV"].iloc[0])
+            perf_chart = (
+                alt.Chart(perf_nav)
+                .mark_line()
+                .encode(
+                    x=alt.X("Date:T", title="Time"),
+                    y=alt.Y("NAV:Q", title="NAV", scale=alt.Scale(domain=[y_start, float(perf_nav["NAV"].max())])),
+                )
+            )
+            st.altair_chart(perf_chart, use_container_width=True)
+
         st.markdown("### Drawdown")
         if nav_series is None or nav_series.dropna().empty:
             st.info("No NAV series yet for drawdown.")
