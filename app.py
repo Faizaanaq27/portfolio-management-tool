@@ -1495,13 +1495,18 @@ def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) 
 
 
 def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
-    if sector_alloc.empty or sector_alloc["exposure"].sum() <= 0:
+    plot_df = sector_alloc.copy()
+    plot_df["exposure"] = pd.to_numeric(plot_df["exposure"], errors="coerce").fillna(0.0)
+    plot_df = plot_df[plot_df["exposure"] > 1e-12].copy()
+
+    if plot_df.empty or plot_df["exposure"].sum() <= 0:
         st.info("No sector allocation available yet.")
         return
+
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.pie(
-        sector_alloc["exposure"],
-        labels=sector_alloc["sector"],
+        plot_df["exposure"],
+        labels=plot_df["sector"],
         autopct="%1.1f%%",
         startangle=90,
         pctdistance=0.78,
