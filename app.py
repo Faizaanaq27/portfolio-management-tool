@@ -1328,6 +1328,7 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df.loc[df["label"] == "CASH", "industry"] = "Cash"
     df["sector"] = df["sector"].fillna("Unknown")
     df["industry"] = df["industry"].fillna("Unknown")
+    df["ticker_display"] = np.where(df["label"] == "CASH", "CASH", df["ticker"])
     df["sector_bucket"] = [classify_sector_bucket(s, i) for s, i in zip(df["sector"], df["industry"]) ]
     df.loc[df["label"] == "CASH", "sector_bucket"] = "Cash"
 
@@ -1342,7 +1343,13 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     industry_alloc = (
         df.groupby(["sector_bucket", "industry"], as_index=False)
-        .agg(exposure=("exposure", "sum"))
+        .agg(
+            exposure=("exposure", "sum"),
+            tickers=(
+                "ticker_display",
+                lambda s: ", ".join(sorted({str(t).strip() for t in s if str(t).strip()})),
+            ),
+        )
         .rename(columns={"sector_bucket": "sector"})
         .sort_values(["sector", "exposure"], ascending=[True, False])
     )
@@ -1488,20 +1495,26 @@ def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) 
 
 
 def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
-    if sector_alloc.empty or sector_alloc["exposure"].sum() <= 0:
+    plot_df = sector_alloc.copy()
+    plot_df["exposure"] = pd.to_numeric(plot_df["exposure"], errors="coerce").fillna(0.0)
+    plot_df = plot_df[plot_df["exposure"] > 1e-12].copy()
+
+    if plot_df.empty or plot_df["exposure"].sum() <= 0:
         st.info("No sector allocation available yet.")
         return
+
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.pie(
-        sector_alloc["exposure"],
-        labels=sector_alloc["sector"],
+        plot_df["exposure"],
+        labels=plot_df["sector"],
         autopct="%1.1f%%",
         startangle=90,
         pctdistance=0.78,
         labeldistance=1.14,
         textprops={"fontsize": 9},
     )
-    ax.set_title(title)
+    ax.set_title(title, pad=24)
+    fig.subplots_adjust(top=0.80)
     ax.axis("equal")
     st.pyplot(fig, clear_figure=True)
 
@@ -1828,7 +1841,7 @@ def render_public_portfolio(
                 use_container_width=True,
             )
         with a2:
-            st.markdown("### Sector → Industry breakdown (ABS exposure, Yahoo Finance)")
+            st.markdown("### Sector → Industry breakdown (ABS exposure)")
             st.dataframe(
                 industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
                 use_container_width=True,
