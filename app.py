@@ -1740,18 +1740,7 @@ def render_public_portfolio(
             st.info("No NAV series yet for performance.")
         else:
             perf_nav = nav_series.dropna().sort_index().to_frame(name="NAV")
-            perf_nav = perf_nav.reset_index()
-            perf_nav = perf_nav.rename(columns={perf_nav.columns[0]: "Date"})
-            y_start = float(perf_nav["NAV"].iloc[0])
-            perf_chart = (
-                alt.Chart(perf_nav)
-                .mark_line()
-                .encode(
-                    x=alt.X("Date:T", title="Time"),
-                    y=alt.Y("NAV:Q", title="NAV", scale=alt.Scale(domain=[y_start, float(perf_nav["NAV"].max())])),
-                )
-            )
-            st.altair_chart(perf_chart, use_container_width=True)
+            st.line_chart(perf_nav)
 
         st.markdown("### Drawdown")
         if nav_series is None or nav_series.dropna().empty:
