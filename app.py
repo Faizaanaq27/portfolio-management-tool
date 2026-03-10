@@ -79,6 +79,60 @@ PORTFOLIO_MIN_DATE = date(2000, 1, 1)
 DEFAULT_CREDIT_SPREAD_PCT = 0.50
 IRX_PROXY_TICKER = "^IRX"
 
+SECTOR_BUCKETS = [
+    "Infrastructure",
+    "Real Estate",
+    "Technology",
+    "Media & Telecommunications",
+    "Consumer & Retail",
+    "Healthcare",
+    "Natural Resources & Energy",
+    "Industrials",
+    "Financial Institutions",
+]
+
+SECTOR_BUCKET_MAP = {
+    "real estate": "Real Estate",
+    "technology": "Technology",
+    "communication services": "Media & Telecommunications",
+    "consumer cyclical": "Consumer & Retail",
+    "consumer defensive": "Consumer & Retail",
+    "healthcare": "Healthcare",
+    "basic materials": "Natural Resources & Energy",
+    "energy": "Natural Resources & Energy",
+    "industrials": "Industrials",
+    "financial services": "Financial Institutions",
+    "utilities": "Infrastructure",
+}
+
+
+def classify_sector_bucket(sector: str, industry: str) -> str:
+    s = str(sector or "").strip().lower()
+    i = str(industry or "").strip().lower()
+
+    if s in SECTOR_BUCKET_MAP:
+        return SECTOR_BUCKET_MAP[s]
+
+    if any(k in i for k in ["bank", "insurance", "asset management", "credit", "financial"]):
+        return "Financial Institutions"
+    if any(k in i for k in ["telecom", "media", "broadcast", "entertainment", "advertising"]):
+        return "Media & Telecommunications"
+    if any(k in i for k in ["reit", "property", "real estate"]):
+        return "Real Estate"
+    if any(k in i for k in ["software", "semiconductor", "internet", "it services", "technology"]):
+        return "Technology"
+    if any(k in i for k in ["biotech", "pharma", "drug", "medical", "health"]):
+        return "Healthcare"
+    if any(k in i for k in ["oil", "gas", "mining", "metals", "chemical", "energy"]):
+        return "Natural Resources & Energy"
+    if any(k in i for k in ["airline", "aerospace", "construction", "machinery", "industrial", "transport"]):
+        return "Industrials"
+    if any(k in i for k in ["consumer", "retail", "restaurant", "apparel", "auto", "food", "beverage"]):
+        return "Consumer & Retail"
+    if any(k in i for k in ["utility", "power", "water", "infrastructure"]):
+        return "Infrastructure"
+    return "Unknown"
+
 
 def _clean_str(x) -> str:
     return str(x).strip() if x is not None else ""
@@ -1274,16 +1328,22 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df.loc[df["label"] == "CASH", "industry"] = "Cash"
     df["sector"] = df["sector"].fillna("Unknown")
     df["industry"] = df["industry"].fillna("Unknown")
+    df["sector_bucket"] = [classify_sector_bucket(s, i) for s, i in zip(df["sector"], df["industry"]) ]
+    df.loc[df["label"] == "CASH", "sector_bucket"] = "Cash"
 
     sector_alloc = (
-        df.groupby(["sector"], as_index=False).agg(exposure=("exposure", "sum")).sort_values("exposure", ascending=False)
+        df.groupby(["sector_bucket"], as_index=False)
+        .agg(exposure=("exposure", "sum"))
+        .rename(columns={"sector_bucket": "sector"})
+        .sort_values("exposure", ascending=False)
     )
     sector_total = float(sector_alloc["exposure"].sum())
     sector_alloc["weight"] = np.where(sector_total > 0, sector_alloc["exposure"] / sector_total, 0.0)
 
     industry_alloc = (
-        df.groupby(["sector", "industry"], as_index=False)
+        df.groupby(["sector_bucket", "industry"], as_index=False)
         .agg(exposure=("exposure", "sum"))
+        .rename(columns={"sector_bucket": "sector"})
         .sort_values(["sector", "exposure"], ascending=[True, False])
     )
     ind_total = float(industry_alloc["exposure"].sum())
@@ -1431,8 +1491,16 @@ def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
     if sector_alloc.empty or sector_alloc["exposure"].sum() <= 0:
         st.info("No sector allocation available yet.")
         return
-    fig, ax = plt.subplots()
-    ax.pie(sector_alloc["exposure"], labels=sector_alloc["sector"], autopct="%1.1f%%", startangle=90)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.pie(
+        sector_alloc["exposure"],
+        labels=sector_alloc["sector"],
+        autopct="%1.1f%%",
+        startangle=90,
+        pctdistance=0.78,
+        labeldistance=1.14,
+        textprops={"fontsize": 9},
+    )
     ax.set_title(title)
     ax.axis("equal")
     st.pyplot(fig, clear_figure=True)
