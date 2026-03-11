@@ -1689,6 +1689,7 @@ st.markdown(
             border: 1px solid rgba(99, 115, 129, 0.35);
             border-radius: 12px;
             background: linear-gradient(180deg, rgba(20,25,32,0.95), rgba(16,20,26,0.95));
+            color: #F3F6FA;
             padding: 12px 16px;
             margin-bottom: 16px;
         }
@@ -1716,6 +1717,7 @@ st.markdown(
             background: rgba(11,16,23,0.95);
             border: 1px solid rgba(99,115,129,0.3);
             border-radius: 12px;
+            color: #F3F6FA;
             padding: 8px 12px;
             margin-bottom: 16px;
         }
@@ -1730,6 +1732,7 @@ st.markdown(
             border-radius: 12px;
             padding: 12px;
             background: rgba(21,27,36,0.92);
+            color: #F3F6FA;
         }
         .kpi-label { font-size: 0.74rem; color: #9AA4B2; text-transform: uppercase; letter-spacing: 0.05em; }
         .kpi-value { font-size: 1.35rem; font-weight: 700; margin: 6px 0; }
@@ -1743,6 +1746,7 @@ st.markdown(
             border-radius: 0.75rem;
             padding: 0.75rem 0.95rem;
             background: rgba(30, 38, 52, 0.45);
+            color: #F3F6FA;
             margin-bottom: 0.8rem;
         }
         .review-box h4 {
@@ -1769,13 +1773,18 @@ def render_kpi_cards(items: list[dict]) -> None:
     cards = []
     for item in items:
         delta = item.get("delta")
-        delta_class = "kpi-delta-pos" if (delta is not None and delta >= 0) else "kpi-delta-neg"
+        delta_label = item.get("delta_label")
+        delta_line = ""
+        if delta_label and delta is not None and pd.notna(delta):
+            delta_class = "kpi-delta-pos" if delta >= 0 else "kpi-delta-neg"
+            delta_line = f"<div class='{delta_class}'>{delta_label}: {_fmt_delta(delta)}</div>"
+
         cards.append(
             (
                 "<div class='kpi-card'>"
                 f"<div class='kpi-label'>{item['label']}</div>"
                 f"<div class='kpi-value'>{item['value']}</div>"
-                f"<div class='{delta_class}'>vs prior: {_fmt_delta(delta)}</div>"
+                f"{delta_line}"
                 f"<div class='kpi-note'>{item.get('note', '')}</div>"
                 "</div>"
             )
@@ -1895,22 +1904,31 @@ def render_public_portfolio(
     one_year_return = _period_return(nav_series, 365)
     quarterly_return = _period_return(nav_series, 90)
 
+    nav_change_1p = np.nan
+    if nav_series is not None:
+        nav_points = nav_series.dropna().sort_index()
+        if len(nav_points) >= 2:
+            prev_nav = float(nav_points.iloc[-2])
+            curr_nav = float(nav_points.iloc[-1])
+            if abs(prev_nav) > 1e-12:
+                nav_change_1p = (curr_nav / prev_nav) - 1.0
+
     current_dd = np.nan
     if nav_series is not None and not nav_series.dropna().empty:
         dd_now = compute_drawdown(nav_series).dropna()
         if not dd_now.empty:
             current_dd = float(dd_now.iloc[-1])
     kpi_items = [
-        {"label": "Portfolio Value", "value": f"${float(snap['nav']):,.0f}", "delta": total_return, "note": "Net asset value"},
-        {"label": "Total Return", "value": f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A", "delta": quarterly_return, "note": "Since inception"},
-        {"label": "Cash", "value": f"${float(snap['cash']):,.0f}", "delta": None, "note": "Available liquidity"},
-        {"label": "Drawdown", "value": f"{current_dd*100:,.2f}%" if pd.notna(current_dd) else "N/A", "delta": current_dd, "note": "From peak NAV"},
-        {"label": "Unrealized Gain", "value": f"${float(snap['unrealized_pnl']):,.0f}", "delta": None, "note": "Open positions"},
-        {"label": "Realized Gain", "value": f"${float(snap['realized_pnl']):,.0f}", "delta": None, "note": "Closed positions"},
-        {"label": "Dividends", "value": f"${float(divpack['total']):,.0f}", "delta": None, "note": "Estimated accrual"},
-        {"label": "Credit/Margin", "value": f"${credit_income_total:,.0f}", "delta": None, "note": "Interest income"},
-        {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "delta": one_year_return, "note": "Trailing 12 months"},
-        {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "delta": quarterly_return, "note": "Trailing quarter"},
+        {"label": "Portfolio Value", "value": f"${float(snap['nav']):,.0f}", "delta": nav_change_1p, "delta_label": "vs previous period", "note": "Net asset value"},
+        {"label": "Total Return", "value": f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A", "note": "Since inception"},
+        {"label": "Cash", "value": f"${float(snap['cash']):,.0f}", "note": "Available liquidity"},
+        {"label": "Drawdown", "value": f"{current_dd*100:,.2f}%" if pd.notna(current_dd) else "N/A", "note": "From peak NAV"},
+        {"label": "Unrealized Gain", "value": f"${float(snap['unrealized_pnl']):,.0f}", "note": "Open positions"},
+        {"label": "Realized Gain", "value": f"${float(snap['realized_pnl']):,.0f}", "note": "Closed positions"},
+        {"label": "Dividends", "value": f"${float(divpack['total']):,.0f}", "note": "Estimated accrual"},
+        {"label": "Credit/Margin", "value": f"${credit_income_total:,.0f}", "note": "Interest income"},
+        {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "note": "Trailing 12 months"},
+        {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "note": "Trailing quarter"},
     ]
     render_kpi_cards(kpi_items)
 
