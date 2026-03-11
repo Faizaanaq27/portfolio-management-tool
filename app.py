@@ -1719,6 +1719,23 @@ st.markdown(
             padding: 8px 12px;
             margin-bottom: 16px;
         }
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit,minmax(220px,1fr));
+            gap: 12px;
+            margin: 8px 0 18px;
+        }
+        .kpi-card {
+            border: 1px solid rgba(99,115,129,0.35);
+            border-radius: 12px;
+            padding: 12px;
+            background: rgba(21,27,36,0.92);
+        }
+        .kpi-label { font-size: 0.74rem; color: #9AA4B2; text-transform: uppercase; letter-spacing: 0.05em; }
+        .kpi-value { font-size: 1.35rem; font-weight: 700; margin: 6px 0; }
+        .kpi-delta-pos { color: #37C48B; font-size: 0.82rem; }
+        .kpi-delta-neg { color: #FF6B6B; font-size: 0.82rem; }
+        .kpi-note { color: #9AA4B2; font-size: 0.75rem; margin-top: 4px; }
         .page-title { font-size: 1.5rem; font-weight: 700; margin: 4px 0 0; }
         .page-subtitle { color: #9AA4B2; margin-top: 2px; }
         .review-box {
@@ -1742,21 +1759,28 @@ st.markdown(
 )
 
 
+def _fmt_delta(v: float | None) -> str:
+    if v is None or pd.isna(v):
+        return "N/A"
+    return f"{v*100:+.2f}%"
 
-def render_kpi_cards(items: list[dict], cards_per_row: int = 5) -> None:
-    for i in range(0, len(items), cards_per_row):
-        row = items[i : i + cards_per_row]
-        cols = st.columns(cards_per_row)
-        for col_idx, col in enumerate(cols):
-            with col:
-                if col_idx < len(row):
-                    item = row[col_idx]
-                    delta = item.get("delta_text")
-                    st.metric(item["label"], item["value"], delta=delta)
-                    if item.get("note"):
-                        st.caption(item["note"])
-                else:
-                    st.empty()
+
+def render_kpi_cards(items: list[dict]) -> None:
+    cards = []
+    for item in items:
+        delta = item.get("delta")
+        delta_class = "kpi-delta-pos" if (delta is not None and delta >= 0) else "kpi-delta-neg"
+        cards.append(
+            f"""
+            <div class='kpi-card'>
+                <div class='kpi-label'>{item['label']}</div>
+                <div class='kpi-value'>{item['value']}</div>
+                <div class='{delta_class}'>vs prior: {_fmt_delta(delta)}</div>
+                <div class='kpi-note'>{item.get('note','')}</div>
+            </div>
+            """
+        )
+    st.markdown(f"<div class='kpi-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Navigation")
@@ -1815,6 +1839,13 @@ def render_public_portfolio(
     credit_income_report = build_monthly_credit_income_report(snap["filtered_txns"])
 
     st.markdown(f"<div class='page-title'>{pname}</div><div class='page-subtitle'>Portfolio drill-down workspace for performance, attribution, income, risk, and positions.</div>", unsafe_allow_html=True)
+    view_name = st.radio(
+        "View",
+        ["Overview", "Long/Short Fund", "Main", "Holdings", "Income", "Risk"],
+        horizontal=True,
+        key=f"view_tabs_{pname}",
+    )
+
     if snap["start_mode"] == "snapshot_start":
         st.info(
             f"Snapshot portfolio — tracking boundary starts {snap['as_of'].date()}. "
@@ -1877,18 +1908,18 @@ def render_public_portfolio(
         if not dd_now.empty:
             current_dd = float(dd_now.iloc[-1])
     kpi_items = [
-        {"label": "Portfolio Value", "value": f"${float(snap['nav']):,.0f}", "delta_text": f"{total_return*100:+.2f}%" if pd.notna(total_return) else None, "note": "Net asset value"},
-        {"label": "Total Return", "value": f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A", "delta_text": f"{quarterly_return*100:+.2f}% QoQ" if pd.notna(quarterly_return) else None, "note": "Since inception"},
-        {"label": "Cash", "value": f"${float(snap['cash']):,.0f}", "delta_text": None, "note": "Available liquidity"},
-        {"label": "Drawdown", "value": f"{current_dd*100:,.2f}%" if pd.notna(current_dd) else "N/A", "delta_text": None, "note": "From peak NAV"},
-        {"label": "Unrealized Gain", "value": f"${float(snap['unrealized_pnl']):,.0f}", "delta_text": None, "note": "Open positions"},
-        {"label": "Realized Gain", "value": f"${float(snap['realized_pnl']):,.0f}", "delta_text": None, "note": "Closed positions"},
-        {"label": "Dividends", "value": f"${float(divpack['total']):,.0f}", "delta_text": None, "note": "Estimated accrual"},
-        {"label": "Credit/Margin", "value": f"${credit_income_total:,.0f}", "delta_text": None, "note": "Interest income"},
-        {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "delta_text": None, "note": "Trailing 12 months"},
-        {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "delta_text": None, "note": "Trailing quarter"},
+        {"label": "Portfolio Value", "value": f"${float(snap['nav']):,.0f}", "delta": total_return, "note": "Net asset value"},
+        {"label": "Total Return", "value": f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A", "delta": quarterly_return, "note": "Since inception"},
+        {"label": "Cash", "value": f"${float(snap['cash']):,.0f}", "delta": None, "note": "Available liquidity"},
+        {"label": "Drawdown", "value": f"{current_dd*100:,.2f}%" if pd.notna(current_dd) else "N/A", "delta": current_dd, "note": "From peak NAV"},
+        {"label": "Unrealized Gain", "value": f"${float(snap['unrealized_pnl']):,.0f}", "delta": None, "note": "Open positions"},
+        {"label": "Realized Gain", "value": f"${float(snap['realized_pnl']):,.0f}", "delta": None, "note": "Closed positions"},
+        {"label": "Dividends", "value": f"${float(divpack['total']):,.0f}", "delta": None, "note": "Estimated accrual"},
+        {"label": "Credit/Margin", "value": f"${credit_income_total:,.0f}", "delta": None, "note": "Interest income"},
+        {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "delta": one_year_return, "note": "Trailing 12 months"},
+        {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "delta": quarterly_return, "note": "Trailing quarter"},
     ]
-    render_kpi_cards(kpi_items, cards_per_row=5)
+    render_kpi_cards(kpi_items)
 
     section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Positions"])
 
