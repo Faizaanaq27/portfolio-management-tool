@@ -29,8 +29,8 @@ def check_password() -> bool:
     if st.session_state.is_admin:
         return True
 
-    with st.sidebar:
-        st.markdown("### Admin login")
+    with st.sidebar.expander("Admin access", expanded=False):
+        st.caption("Lower-priority controls")
         pw = st.text_input("Password", type="password")
         if st.button("Log in"):
             secret = st.secrets.get("ADMIN_PASSWORD", "")
@@ -43,13 +43,6 @@ def check_password() -> bool:
 
 
 is_admin = check_password()
-
-with st.sidebar:
-    st.markdown("---")
-    st.write("Mode:", "✅ Admin (edit enabled)" if is_admin else "👀 Public (read-only)")
-    if is_admin and st.button("Log out"):
-        st.session_state.is_admin = False
-        st.rerun()
 
 # =========================
 # 2) Storage (CSV)
@@ -1684,15 +1677,55 @@ portfolio_names = portfolios_df["portfolio"].tolist()
 # 6) UI
 # =========================
 st.title("Brown Investment Group Portfolio")
-st.caption("Public view is read-only. Admin can edit portfolios, baseline lots, and transactions.")
 st.markdown(
     """
     <style>
+        .main .block-container {
+            max-width: 1520px;
+            padding-top: 1.25rem;
+            padding-bottom: 1.25rem;
+        }
+        .appbar {
+            border: 1px solid rgba(99, 115, 129, 0.35);
+            border-radius: 12px;
+            background: linear-gradient(180deg, rgba(20,25,32,0.95), rgba(16,20,26,0.95));
+            padding: 12px 16px;
+            margin-bottom: 16px;
+        }
+        .appbar-grid {
+            display: grid;
+            grid-template-columns: 1.7fr 1.3fr;
+            gap: 16px;
+            align-items: center;
+        }
+        .appbar-title { font-size: 1.05rem; font-weight: 700; margin: 0; }
+        .appbar-sub { font-size: 0.78rem; color: #9AA4B2; margin: 2px 0 0 0; }
+        .status-badge {
+            display: inline-block;
+            font-size: 0.72rem;
+            border: 1px solid rgba(73, 206, 255, 0.5);
+            color: #7FDBFF;
+            border-radius: 999px;
+            padding: 2px 8px;
+            margin-left: 8px;
+        }
+        .filter-bar {
+            position: sticky;
+            top: 0.5rem;
+            z-index: 10;
+            background: rgba(11,16,23,0.95);
+            border: 1px solid rgba(99,115,129,0.3);
+            border-radius: 12px;
+            padding: 8px 12px;
+            margin-bottom: 16px;
+        }
+        .page-title { font-size: 1.5rem; font-weight: 700; margin: 4px 0 0; }
+        .page-subtitle { color: #9AA4B2; margin-top: 2px; }
         .review-box {
             border: 1px solid rgba(49, 51, 63, 0.2);
             border-radius: 0.75rem;
-            padding: 0.9rem 1rem;
-            background: rgba(240, 242, 246, 0.45);
+            padding: 0.75rem 0.95rem;
+            background: rgba(30, 38, 52, 0.45);
             margin-bottom: 0.8rem;
         }
         .review-box h4 {
@@ -1708,17 +1741,60 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.sidebar.header("Settings")
-analyze_on_date = st.sidebar.date_input(
-    "Analyze on date",
-    value=date.today(),
-    key="sidebar_analyze_on_date",
-    help="All holdings, P&L, NAV, and contribution analytics are evaluated as of this date.",
-)
-match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
 
-freq_choice = st.sidebar.selectbox("Chart frequency", ["Weekly (Mon)", "Daily"], index=0)
+
+def render_kpi_cards(items: list[dict], cards_per_row: int = 5) -> None:
+    for i in range(0, len(items), cards_per_row):
+        row = items[i : i + cards_per_row]
+        cols = st.columns(cards_per_row)
+        for col_idx, col in enumerate(cols):
+            with col:
+                if col_idx < len(row):
+                    item = row[col_idx]
+                    delta = item.get("delta_text")
+                    st.metric(item["label"], item["value"], delta=delta)
+                    if item.get("note"):
+                        st.caption(item["note"])
+                else:
+                    st.empty()
+
+with st.sidebar:
+    st.header("Navigation")
+    nav_focus = st.radio("Primary area", ["Overview", "Portfolios", "Admin"], horizontal=True)
+    with st.expander("Filters", expanded=True):
+        analyze_on_date = st.date_input(
+            "Analyze on date",
+            value=date.today(),
+            key="sidebar_analyze_on_date",
+            help="All holdings, P&L, NAV, and contribution analytics are evaluated as of this date.",
+        )
+        match_method = st.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
+        freq_choice = st.selectbox("Chart frequency", ["Weekly (Mon)", "Daily"], index=0)
+    with st.expander("Admin", expanded=False):
+        st.write("Mode:", "✅ Admin (edit enabled)" if is_admin else "👀 Public (read-only)")
+        if is_admin and st.button("Log out"):
+            st.session_state.is_admin = False
+            st.rerun()
+
 chart_freq = "W-MON" if freq_choice.startswith("Weekly") else "D"
+
+st.markdown(
+    f"""
+    <div class='appbar'>
+        <div class='appbar-grid'>
+            <div>
+                <p class='appbar-title'>🏛️ Brown Investment Group Portfolio Platform <span class='status-badge'>{'ADMIN' if is_admin else 'PUBLIC'}</span></p>
+                <p class='appbar-sub'>Institutional multi-portfolio analytics • Last updated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}</p>
+            </div>
+            <div style='text-align:right;color:#9AA4B2;'>
+                ⤓ Export&nbsp;&nbsp;&nbsp;↗ Share&nbsp;&nbsp;&nbsp;⚙ Settings&nbsp;&nbsp;&nbsp;👤 User
+            </div>
+        </div>
+    </div>
+    <div class='filter-bar'><b>Sticky filters:</b> Portfolio scope: {nav_focus} &nbsp;|&nbsp; Analyze date: {analyze_on_date} &nbsp;|&nbsp; Frequency: {freq_choice} &nbsp;|&nbsp; Benchmark: SPY</div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ---------- Public view ----------
 st.subheader("Public View (read-only)")
@@ -1738,6 +1814,7 @@ def render_public_portfolio(
     snap = portfolio_snapshot(meta, p_txns, p_base, match_method, valuation_date=analyze_date)
     credit_income_report = build_monthly_credit_income_report(snap["filtered_txns"])
 
+    st.markdown(f"<div class='page-title'>{pname}</div><div class='page-subtitle'>Portfolio drill-down workspace for performance, attribution, income, risk, and positions.</div>", unsafe_allow_html=True)
     if snap["start_mode"] == "snapshot_start":
         st.info(
             f"Snapshot portfolio — tracking boundary starts {snap['as_of'].date()}. "
@@ -1746,20 +1823,20 @@ def render_public_portfolio(
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
 
-    st.markdown(
-        """
-        <div class="review-box">
-            <h4>How to review this portfolio</h4>
-            <ul>
-                <li><b>Health:</b> Start with NAV, cash, and market value to understand size and liquidity.</li>
-                <li><b>Performance:</b> Use P&amp;L, drawdown, and relative growth to judge outcomes over time.</li>
-                <li><b>Drivers:</b> Review sector allocation and ticker contribution to see what is helping or hurting.</li>
-                <li><b>Risk:</b> Check beta/alpha vs SPY and concentration in holdings/lots.</li>
-            </ul>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    with st.expander("How to read this portfolio", expanded=False):
+        st.markdown(
+            """
+            <div class="review-box">
+                <ul>
+                    <li><b>Health:</b> Start with value, cash, and liquidity metrics.</li>
+                    <li><b>Performance:</b> Compare NAV trajectory vs benchmark and drawdown.</li>
+                    <li><b>Drivers:</b> Use contribution tables for sector and position effects.</li>
+                    <li><b>Risk:</b> Review beta, concentration, volatility proxies, and exposures.</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     def _period_return(nav_s: pd.Series | None, lookback_days: int | None = None) -> float:
         if nav_s is None:
@@ -1794,41 +1871,49 @@ def render_public_portfolio(
     one_year_return = _period_return(nav_series, 365)
     quarterly_return = _period_return(nav_series, 90)
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("NAV", f"${float(snap['nav']):,.2f}")
-    k2.metric("Market Value", f"${float(snap['market_value']):,.2f}")
-    k3.metric("Cash", f"${float(snap['cash']):,.2f}")
+    current_dd = np.nan
+    if nav_series is not None and not nav_series.dropna().empty:
+        dd_now = compute_drawdown(nav_series).dropna()
+        if not dd_now.empty:
+            current_dd = float(dd_now.iloc[-1])
+    kpi_items = [
+        {"label": "Portfolio Value", "value": f"${float(snap['nav']):,.0f}", "delta_text": f"{total_return*100:+.2f}%" if pd.notna(total_return) else None, "note": "Net asset value"},
+        {"label": "Total Return", "value": f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A", "delta_text": f"{quarterly_return*100:+.2f}% QoQ" if pd.notna(quarterly_return) else None, "note": "Since inception"},
+        {"label": "Cash", "value": f"${float(snap['cash']):,.0f}", "delta_text": None, "note": "Available liquidity"},
+        {"label": "Drawdown", "value": f"{current_dd*100:,.2f}%" if pd.notna(current_dd) else "N/A", "delta_text": None, "note": "From peak NAV"},
+        {"label": "Unrealized Gain", "value": f"${float(snap['unrealized_pnl']):,.0f}", "delta_text": None, "note": "Open positions"},
+        {"label": "Realized Gain", "value": f"${float(snap['realized_pnl']):,.0f}", "delta_text": None, "note": "Closed positions"},
+        {"label": "Dividends", "value": f"${float(divpack['total']):,.0f}", "delta_text": None, "note": "Estimated accrual"},
+        {"label": "Credit/Margin", "value": f"${credit_income_total:,.0f}", "delta_text": None, "note": "Interest income"},
+        {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "delta_text": None, "note": "Trailing 12 months"},
+        {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "delta_text": None, "note": "Trailing quarter"},
+    ]
+    render_kpi_cards(kpi_items, cards_per_row=5)
 
-    k4, k5, k6, k7 = st.columns(4)
-    k4.metric("Unrealized Gain", f"${float(snap['unrealized_pnl']):,.2f}")
-    k5.metric("Realized Gain", f"${float(snap['realized_pnl']):,.2f}")
-    k6.metric("Dividends", f"${float(divpack['total']):,.2f}")
-    k7.metric("Credit Income", f"${credit_income_total:,.2f}")
-
-    k8, k9, k10 = st.columns(3)
-    k8.metric(
-        "Total Return since inception",
-        f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A",
-    )
-    k9.metric("1 yr Return", f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A")
-    k10.metric("Quarterly return", f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A")
-
-    section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Position Details"])
+    section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Positions"])
 
     with section_tabs[0]:
-        st.markdown("### All-time performance (NAV)")
+        st.markdown("### NAV / performance")
         if nav_series is None or nav_series.dropna().empty:
             st.info("No NAV series yet for performance.")
         else:
             perf_nav = nav_series.dropna().sort_index().to_frame(name="NAV")
             st.line_chart(perf_nav)
-
-        st.markdown("### Drawdown")
-        if nav_series is None or nav_series.dropna().empty:
-            st.info("No NAV series yet for drawdown.")
-        else:
-            dd = compute_drawdown(nav_series)
-            st.line_chart(dd)
+        cperf1, cperf2 = st.columns(2)
+        with cperf1:
+            st.markdown("### Drawdown")
+            if nav_series is None or nav_series.dropna().empty:
+                st.info("No NAV series yet for drawdown.")
+            else:
+                dd = compute_drawdown(nav_series)
+                st.line_chart(dd)
+        with cperf2:
+            st.markdown("### Rolling / monthly returns")
+            if nav_series is None or nav_series.dropna().empty:
+                st.info("No return series available.")
+            else:
+                ret = nav_series.pct_change().dropna()
+                st.bar_chart(ret.tail(24))
 
     with section_tabs[1]:
         sector_alloc, industry_alloc = build_allocation_tables(snap)
@@ -1914,8 +1999,39 @@ def render_public_portfolio(
 
     with section_tabs[4]:
         if not snap["holdings"].empty:
-            st.markdown("### Holdings (net shares can be negative for shorts)")
-            st.dataframe(snap["holdings"], use_container_width=True)
+            st.markdown("### Holdings (searchable, sortable)")
+            h = snap["holdings"].copy()
+            rename_map = {
+                "ticker": "ticker",
+                "net_shares": "shares",
+                "avg_cost": "cost basis",
+                "last_price": "price",
+                "market_value": "market value",
+                "unrealized_pnl": "unrealized P/L",
+                "realized_pnl": "realized P/L",
+                "dividend_yield": "dividend yield",
+                "sector_bucket": "sector",
+            }
+            h = h.rename(columns={k: v for k, v in rename_map.items() if k in h.columns})
+            query = st.text_input("Search ticker or name", key=f"holding_query_{pname}")
+            quick = st.selectbox("Quick filter", ["All", "Winners", "Losers", "Largest Positions", "Highest Yield"], key=f"quick_hold_{pname}")
+            if query:
+                qq = query.lower()
+                mask = h.get("ticker", pd.Series("", index=h.index)).astype(str).str.lower().str.contains(qq)
+                if "name" in h.columns:
+                    mask = mask | h["name"].astype(str).str.lower().str.contains(qq)
+                h = h[mask]
+            if quick == "Winners" and "unrealized P/L" in h.columns:
+                h = h[h["unrealized P/L"] > 0]
+            elif quick == "Losers" and "unrealized P/L" in h.columns:
+                h = h[h["unrealized P/L"] < 0]
+            elif quick == "Largest Positions" and "market value" in h.columns:
+                h = h.sort_values("market value", ascending=False).head(15)
+            elif quick == "Highest Yield" and "dividend yield" in h.columns:
+                h = h.sort_values("dividend yield", ascending=False).head(15)
+            if "last updated" not in h.columns:
+                h["last updated"] = pd.to_datetime(analyze_date).date().isoformat()
+            st.dataframe(h, use_container_width=True)
 
         if not snap["lots"].empty:
             st.markdown("### Open lots (baseline + trades) — LONG & SHORT")
