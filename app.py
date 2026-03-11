@@ -1689,6 +1689,7 @@ st.markdown(
             border: 1px solid rgba(99, 115, 129, 0.35);
             border-radius: 12px;
             background: linear-gradient(180deg, rgba(20,25,32,0.95), rgba(16,20,26,0.95));
+            color: #F3F6FA;
             padding: 12px 16px;
             margin-bottom: 16px;
         }
@@ -1716,6 +1717,7 @@ st.markdown(
             background: rgba(11,16,23,0.95);
             border: 1px solid rgba(99,115,129,0.3);
             border-radius: 12px;
+            color: #F3F6FA;
             padding: 8px 12px;
             margin-bottom: 16px;
         }
@@ -1730,6 +1732,7 @@ st.markdown(
             border-radius: 12px;
             padding: 12px;
             background: rgba(21,27,36,0.92);
+            color: #F3F6FA;
         }
         .kpi-label { font-size: 0.74rem; color: #9AA4B2; text-transform: uppercase; letter-spacing: 0.05em; }
         .kpi-value { font-size: 1.35rem; font-weight: 700; margin: 6px 0; }
@@ -1743,6 +1746,7 @@ st.markdown(
             border-radius: 0.75rem;
             padding: 0.75rem 0.95rem;
             background: rgba(30, 38, 52, 0.45);
+            color: #F3F6FA;
             margin-bottom: 0.8rem;
         }
         .review-box h4 {
