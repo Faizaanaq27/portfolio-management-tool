@@ -1771,14 +1771,14 @@ def render_kpi_cards(items: list[dict]) -> None:
         delta = item.get("delta")
         delta_class = "kpi-delta-pos" if (delta is not None and delta >= 0) else "kpi-delta-neg"
         cards.append(
-            f"""
-            <div class='kpi-card'>
-                <div class='kpi-label'>{item['label']}</div>
-                <div class='kpi-value'>{item['value']}</div>
-                <div class='{delta_class}'>vs prior: {_fmt_delta(delta)}</div>
-                <div class='kpi-note'>{item.get('note','')}</div>
-            </div>
-            """
+            (
+                "<div class='kpi-card'>"
+                f"<div class='kpi-label'>{item['label']}</div>"
+                f"<div class='kpi-value'>{item['value']}</div>"
+                f"<div class='{delta_class}'>vs prior: {_fmt_delta(delta)}</div>"
+                f"<div class='kpi-note'>{item.get('note', '')}</div>"
+                "</div>"
+            )
         )
     st.markdown(f"<div class='kpi-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
@@ -1839,13 +1839,6 @@ def render_public_portfolio(
     credit_income_report = build_monthly_credit_income_report(snap["filtered_txns"])
 
     st.markdown(f"<div class='page-title'>{pname}</div><div class='page-subtitle'>Portfolio drill-down workspace for performance, attribution, income, risk, and positions.</div>", unsafe_allow_html=True)
-    view_name = st.radio(
-        "View",
-        ["Overview", "Long/Short Fund", "Main", "Holdings", "Income", "Risk"],
-        horizontal=True,
-        key=f"view_tabs_{pname}",
-    )
-
     if snap["start_mode"] == "snapshot_start":
         st.info(
             f"Snapshot portfolio — tracking boundary starts {snap['as_of'].date()}. "
