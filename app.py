@@ -289,7 +289,7 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
     else:
         close = pd.Series({tickers[0]: data["Close"].iloc[-1]})
 
-    close.index = [str(x).upper() for x in close.index]
+    close.index = [str(x).upper().strip() for x in close.index]
     return close.astype(float)
 
 
@@ -327,18 +327,19 @@ def fetch_prices_on_or_before(tickers: list[str], d: date) -> pd.Series:
     today_n = pd.to_datetime(date.today()).normalize()
 
     if target >= today_n:
-        return fetch_last_prices(cleaned)
+        result = fetch_last_prices(cleaned)
+    else:
+        start = target - pd.Timedelta(days=14)
+        px = fetch_price_history(cleaned, start=start, end=target)
+        if px is None or px.empty:
+            return pd.Series(dtype=float)
+        px = px[px.index <= target]
+        if px.empty:
+            return pd.Series(dtype=float)
+        result = px.iloc[-1].astype(float)
 
-    start = target - pd.Timedelta(days=14)
-    px = fetch_price_history(cleaned, start=start, end=target)
-    if px is None or px.empty:
-        return pd.Series(dtype=float)
-
-    px = px[px.index <= target]
-    if px.empty:
-        return pd.Series(dtype=float)
-
-    return px.iloc[-1].astype(float)
+    result.index = [str(x).upper().strip() for x in result.index]
+    return result
 
 
 @st.cache_data(ttl=1800)
