@@ -1955,8 +1955,8 @@ def render_public_portfolio(
             "title": "Performance",
             "items": [
                 {"label": "Total Return", "value": f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A", "note": "Since inception"},
-                {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "note": "Trailing 12 months"},
-                {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "note": "Trailing quarter"},
+                {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "note": "Trailing 12 months (requires >=1 year of NAV history)"},
+                {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "note": "Trailing quarter (requires >=90 days of NAV history)"},
                 {"label": "Realized Gain", "value": f"${float(snap['realized_pnl']):,.0f}", "note": "Closed positions"},
             ],
         },
@@ -1969,6 +1969,19 @@ def render_public_portfolio(
         },
     ]
     render_kpi_sections(kpi_sections)
+
+    nav_obs = 0 if nav_series is None else int(nav_series.dropna().shape[0])
+    if nav_obs < 2:
+        st.info(
+            "Performance charts need at least two NAV observations. "
+            "With only one valuation point, return and drawdown panels will be blank or N/A."
+        )
+    if divpack["quarterly"] is None or divpack["quarterly"].empty:
+        st.info(
+            "Dividend tracker only shows estimated cash when BOTH conditions are met: "
+            "(1) the portfolio had LONG shares on dividend dates, and "
+            "(2) the ticker has dividend events available from market data."
+        )
 
     section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Positions"])
 
@@ -1993,7 +2006,10 @@ def render_public_portfolio(
                 st.info("No return series available.")
             else:
                 ret = nav_series.pct_change().dropna()
-                st.bar_chart(ret.tail(24))
+                if ret.empty:
+                    st.info("Need at least two NAV points to compute period returns.")
+                else:
+                    st.bar_chart(ret.tail(24))
 
     with section_tabs[1]:
         sector_alloc, industry_alloc = build_allocation_tables(snap)
@@ -2050,7 +2066,10 @@ def render_public_portfolio(
 
         st.markdown("### Dividend tracker (estimated)")
         if divpack["quarterly"] is None or divpack["quarterly"].empty:
-            st.info("No dividend events found for held LONG tickers in this period.")
+            st.info(
+                "No dividend events were matched for held LONG tickers in this analysis window. "
+                "If holdings were short-only, cash-only, or very recent, this can be expected."
+            )
         else:
             st.dataframe(divpack["quarterly"], use_container_width=True)
             st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
