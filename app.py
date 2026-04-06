@@ -1513,7 +1513,7 @@ def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
 
 
 # =========================
-# 4c) Dividend tracker (quarterly accrual)
+# 4c) Dividend tracker (manual-posted first, market-estimated fallback)
 # =========================
 def compute_daily_shares_df(
     pname: str,
@@ -1598,6 +1598,38 @@ def compute_dividend_accrual_quarterly(
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
+    manual = txns_all[txns_all["portfolio"] == pname].copy()
+    if not manual.empty:
+        manual["date"] = pd.to_datetime(manual["date"], errors="coerce").dt.normalize()
+        manual["type"] = manual["type"].astype(str).str.lower().str.strip()
+        manual["ticker"] = manual["ticker"].fillna("").astype(str).str.upper().str.strip()
+        manual["amount"] = pd.to_numeric(manual["amount"], errors="coerce").fillna(0.0)
+        manual = manual[
+            (manual["type"] == "dividend")
+            & manual["date"].notna()
+            & (manual["date"] >= start)
+            & (manual["date"] <= end)
+            & (manual["amount"] > 0)
+        ].copy()
+    if not manual.empty:
+        manual["ticker"] = manual["ticker"].replace("", "CASH")
+        manual["div_date"] = manual["date"]
+        manual["div_per_share"] = np.nan
+        manual["shares"] = np.nan
+        manual["div_cash"] = manual["amount"]
+        manual["quarter"] = manual["div_date"].dt.to_period("Q").astype(str)
+        manual["quarter_end"] = manual["div_date"].dt.to_period("Q").dt.end_time.dt.normalize()
+        manual["source"] = "manual_posted"
+        cols = ["ticker", "div_date", "div_per_share", "shares", "div_cash", "quarter", "quarter_end", "source"]
+        ev_manual = manual[cols].sort_values(["div_date", "ticker"]).reset_index(drop=True)
+        q_manual = (
+            ev_manual.groupby(["quarter", "quarter_end"], as_index=False)
+            .agg(div_cash=("div_cash", "sum"))
+            .sort_values("quarter_end")
+            .reset_index(drop=True)
+        )
+        return {"total": float(ev_manual["div_cash"].sum()), "events": ev_manual, "quarterly": q_manual}
+
     shares_df = compute_daily_shares_df(pname, meta, txns_all, baseline_all, end)
     if shares_df.empty or shares_df.shape[1] == 0:
         return {"total": 0.0, "events": pd.DataFrame(), "quarterly": pd.DataFrame()}
@@ -1627,6 +1659,7 @@ def compute_dividend_accrual_quarterly(
                     "div_cash": float(v) * sh_long,
                     "quarter": str(d.to_period("Q")),
                     "quarter_end": d.to_period("Q").end_time.normalize(),
+                    "source": "market_estimated",
                 }
             )
 
@@ -1955,8 +1988,8 @@ def render_public_portfolio(
             "title": "Performance",
             "items": [
                 {"label": "Total Return", "value": f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A", "note": "Since inception"},
-                {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "note": "Trailing 12 months"},
-                {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "note": "Trailing quarter"},
+                {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "note": "Trailing 12 months (requires >=1 year of NAV history)"},
+                {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "note": "Trailing quarter (requires >=90 days of NAV history)"},
                 {"label": "Realized Gain", "value": f"${float(snap['realized_pnl']):,.0f}", "note": "Closed positions"},
             ],
         },
@@ -1969,6 +2002,18 @@ def render_public_portfolio(
         },
     ]
     render_kpi_sections(kpi_sections)
+
+    nav_obs = 0 if nav_series is None else int(nav_series.dropna().shape[0])
+    if nav_obs < 2:
+        st.info(
+            "Performance charts need at least two NAV observations. "
+            "With only one valuation point, return and drawdown panels will be blank or N/A."
+        )
+    if divpack["quarterly"] is None or divpack["quarterly"].empty:
+        st.info(
+            "Dividend tracker uses posted dividend transactions first; if none exist, "
+            "it falls back to market-estimated dividends based on LONG shares held on dividend dates."
+        )
 
     section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Positions"])
 
@@ -1993,7 +2038,10 @@ def render_public_portfolio(
                 st.info("No return series available.")
             else:
                 ret = nav_series.pct_change().dropna()
-                st.bar_chart(ret.tail(24))
+                if ret.empty:
+                    st.info("Need at least two NAV points to compute period returns.")
+                else:
+                    st.bar_chart(ret.tail(24))
 
     with section_tabs[1]:
         sector_alloc, industry_alloc = build_allocation_tables(snap)
@@ -2048,9 +2096,12 @@ def render_public_portfolio(
             chart_credit["month"] = pd.to_datetime(chart_credit["month"])
             st.bar_chart(chart_credit.set_index("month")[["total_credit_income"]].sort_index())
 
-        st.markdown("### Dividend tracker (estimated)")
+        st.markdown("### Dividend tracker (posted or estimated)")
         if divpack["quarterly"] is None or divpack["quarterly"].empty:
-            st.info("No dividend events found for held LONG tickers in this period.")
+            st.info(
+                "No posted dividend transactions were found, and no market-estimated dividend events "
+                "matched held LONG positions in this analysis window."
+            )
         else:
             st.dataframe(divpack["quarterly"], use_container_width=True)
             st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
@@ -2184,7 +2235,7 @@ with public_tabs[0]:
     c1.metric("ALL Total Cash", f"${total_cash:,.2f}")
     c2.metric("ALL Total Gains (P&L)", f"${total_pnl:,.2f}")
     c3.metric("ALL NAV (Cash + MV)", f"${agg_nav_last:,.2f}")
-    c4.metric("ALL Dividends (estimated)", f"${total_div:,.2f}")
+    c4.metric("ALL Dividends (posted/estimated)", f"${total_div:,.2f}")
 
     st.divider()
 
@@ -2226,10 +2277,10 @@ with public_tabs[0]:
             st.line_chart(dd_agg)
 
     st.divider()
-    st.markdown("### Dividend totals by portfolio (estimated)")
+    st.markdown("### Dividend totals by portfolio (posted/estimated)")
     div_tbl = pd.DataFrame(
-        [{"portfolio": p, "dividends_estimated": float(div_total_by_port.get(p, 0.0))} for p in portfolio_names]
-    ).sort_values("dividends_estimated", ascending=False)
+        [{"portfolio": p, "dividends_total": float(div_total_by_port.get(p, 0.0))} for p in portfolio_names]
+    ).sort_values("dividends_total", ascending=False)
     st.dataframe(div_tbl, use_container_width=True)
 
 
@@ -2919,7 +2970,7 @@ Notes:
   - minus a configurable annual haircut/spread (default **0.50%**) set in Portfolio Settings
 - If a manual `credit_interest` transaction already exists in a month, auto-accrual is skipped for that month.
 
-**Dividends:** estimated dividend accrual is calculated on LONG shares only (does not model borrow costs / dividends-in-lieu on shorts).
+**Dividends:** posted `dividend` transactions are used when available; otherwise an estimated accrual is calculated on LONG shares only (does not model borrow costs / dividends-in-lieu on shorts).
 
 ### Bulk upload CSV
 
