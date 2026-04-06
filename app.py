@@ -18,7 +18,7 @@ st.set_page_config(page_title="Multi-Portfolio Tracker (Cash + Snapshot)", layou
 # =========================
 LOGO_PATH = Path(__file__).parent / "biglogo-white.png"
 if LOGO_PATH.exists():
-    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+    st.sidebar.image(str(LOGO_PATH), width="stretch")
 
 # =========================
 # 1) Single-login gate
@@ -360,6 +360,26 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
     px.index = pd.to_datetime(px.index).normalize()
     px = px.sort_index().ffill()
     return px
+
+
+def fetch_single_ticker_history(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    t = str(ticker).upper().strip()
+    if not t:
+        return pd.Series(dtype=float)
+    raw = _safe_download(
+        [t],
+        start=pd.to_datetime(start).date(),
+        end=(pd.to_datetime(end) + pd.Timedelta(days=1)).date(),
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+    )
+    px = _extract_close_frame(raw, [t])
+    if px.empty:
+        return pd.Series(dtype=float)
+    s = px[t] if t in px.columns else px.iloc[:, 0]
+    s.index = pd.to_datetime(s.index).normalize()
+    return s.sort_index().dropna()
 
 
 def fetch_prices_on_or_before(tickers: list[str], d: date) -> pd.Series:
@@ -2211,13 +2231,13 @@ def render_public_portfolio(
             render_sector_pie(sector_alloc, f"{pname} — Sector Exposure (Abs)")
             st.dataframe(
                 sector_alloc.assign(weight_pct=(sector_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
-                use_container_width=True,
+                width="stretch",
             )
         with a2:
             st.markdown("### Sector → Industry breakdown (ABS exposure)")
             st.dataframe(
                 industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
-                use_container_width=True,
+                width="stretch",
             )
 
         st.markdown("### Contribution to return (P&L contribution by ticker)")
@@ -2229,7 +2249,7 @@ def render_public_portfolio(
             for col in ["unrealized_return_pct", "realized_return_pct"]:
                 show_contrib[col] = pd.to_numeric(show_contrib[col], errors="coerce")
                 show_contrib[col] = show_contrib[col].map(lambda x: f"{x:,.2f}%" if pd.notna(x) else "N/A")
-            st.dataframe(show_contrib, use_container_width=True)
+            st.dataframe(show_contrib, width="stretch")
             chart_df = contrib.set_index("ticker")[["total_contribution"]]
             st.bar_chart(chart_df)
 
@@ -2242,7 +2262,7 @@ def render_public_portfolio(
             for col in ["avg_buy_price", "avg_sold_price", "current_price"]:
                 show_px[col] = pd.to_numeric(show_px[col], errors="coerce")
                 show_px[col] = show_px[col].map(lambda x: f"${x:,.4f}" if pd.notna(x) else "N/A")
-            st.dataframe(show_px, use_container_width=True)
+            st.dataframe(show_px, width="stretch")
 
     with section_tabs[2]:
         st.markdown("### Monthly credit income")
@@ -2251,7 +2271,7 @@ def render_public_portfolio(
         else:
             show_credit = credit_income_report.copy()
             show_credit["month"] = pd.to_datetime(show_credit["month"]).dt.strftime("%Y-%m")
-            st.dataframe(show_credit, use_container_width=True)
+            st.dataframe(show_credit, width="stretch")
             chart_credit = credit_income_report.copy()
             chart_credit["month"] = pd.to_datetime(chart_credit["month"])
             st.bar_chart(chart_credit.set_index("month")[["total_credit_income"]].sort_index())
@@ -2272,7 +2292,7 @@ def render_public_portfolio(
                     + ". This usually means the upstream Yahoo endpoint returned no actions data."
                 )
         else:
-            st.dataframe(divpack["quarterly"], use_container_width=True)
+            st.dataframe(divpack["quarterly"], width="stretch")
             st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
 
     with section_tabs[3]:
@@ -2331,11 +2351,11 @@ def render_public_portfolio(
                 h = h.sort_values("dividend yield", ascending=False).head(15)
             if "last updated" not in h.columns:
                 h["last updated"] = pd.to_datetime(analyze_date).date().isoformat()
-            st.dataframe(h, use_container_width=True)
+            st.dataframe(h, width="stretch")
 
         if not snap["lots"].empty:
             st.markdown("### Open lots (baseline + trades) — LONG & SHORT")
-            st.dataframe(snap["lots"].sort_values(["ticker", "buy_date"]), use_container_width=True)
+            st.dataframe(snap["lots"].sort_values(["ticker", "buy_date"]), width="stretch")
 
         if not snap["realized"].empty:
             rv = snap["realized"].copy()
@@ -2345,13 +2365,13 @@ def render_public_portfolio(
                 np.nan,
             )
             st.markdown("### Realized matches (per lot) — sells & covers")
-            st.dataframe(rv.sort_values(["sell_date", "ticker"], ascending=False), use_container_width=True)
+            st.dataframe(rv.sort_values(["sell_date", "ticker"], ascending=False), width="stretch")
 
         st.markdown("### Transactions (filtered by boundary when snapshot)")
         if snap["filtered_txns"].empty:
             st.write("No transactions.")
         else:
-            st.dataframe(snap["filtered_txns"], use_container_width=True)
+            st.dataframe(snap["filtered_txns"], width="stretch")
 
 
 # ----------------------------
@@ -2450,7 +2470,7 @@ with public_tabs[0]:
     div_tbl = pd.DataFrame(
         [{"portfolio": p, "dividends_total": float(div_total_by_port.get(p, 0.0))} for p in portfolio_names]
     ).sort_values("dividends_total", ascending=False)
-    st.dataframe(div_tbl, use_container_width=True)
+    st.dataframe(div_tbl, width="stretch")
 
 
 # ----------------------------
@@ -2755,7 +2775,7 @@ Notes:
 
         if isinstance(raw_import, pd.DataFrame) and not raw_import.empty:
             st.write("Parsed rows (pre-price fill):")
-            st.dataframe(raw_import, use_container_width=True)
+            st.dataframe(raw_import, width="stretch")
 
             if st.button("Preview with prices", key=f"bulk_preview_btn__{active}"):
                 good, bad = enrich_import_with_prices(raw_import)
@@ -2768,11 +2788,11 @@ Notes:
 
         if isinstance(bad, pd.DataFrame) and not bad.empty:
             st.warning(f"Skipped: {len(bad)} rows.")
-            st.dataframe(bad, use_container_width=True)
+            st.dataframe(bad, width="stretch")
 
         if isinstance(good, pd.DataFrame) and not good.empty:
             st.success(f"Ready to import: {len(good)} rows.")
-            st.dataframe(good, use_container_width=True)
+            st.dataframe(good, width="stretch")
 
             if st.button("✅ Import into portfolio", type="primary", key=f"bulk_import_btn__{active}"):
                 rows = []
@@ -2873,14 +2893,14 @@ Notes:
 
         if isinstance(credit_bad, pd.DataFrame) and not credit_bad.empty:
             st.warning(f"Skipped credit_interest rows: {len(credit_bad)}")
-            st.dataframe(credit_bad, use_container_width=True)
+            st.dataframe(credit_bad, width="stretch")
 
         if isinstance(credit_good, pd.DataFrame) and not credit_good.empty:
             st.success(f"Ready to import credit_interest rows: {len(credit_good)}")
 
             credit_preview = credit_good.copy()
             credit_preview["date"] = pd.to_datetime(credit_preview["date"]).dt.date.astype(str)
-            st.dataframe(credit_preview, use_container_width=True)
+            st.dataframe(credit_preview, width="stretch")
 
             if st.button("✅ Import monthly credit_interest", type="primary", key=f"credit_import_btn__{active}"):
                 rows = []
@@ -3077,7 +3097,7 @@ Notes:
             if p_base.empty:
                 st.info("No baseline lots yet.")
             else:
-                st.dataframe(p_base.sort_values(["ticker", "buy_date"]), use_container_width=True)
+                st.dataframe(p_base.sort_values(["ticker", "buy_date"]), width="stretch")
 
                 p_base_disp = p_base.copy()
                 p_base_disp["display"] = (
