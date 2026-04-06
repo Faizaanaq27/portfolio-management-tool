@@ -2,13 +2,13 @@
 import hmac
 from datetime import date
 from pathlib import Path
-import re
 
+import matplotlib.pyplot as plt
 import numpy as np
+import altair as alt
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Multi-Portfolio Tracker (Cash + Snapshot)", layout="wide")
 
@@ -29,8 +29,8 @@ def check_password() -> bool:
     if st.session_state.is_admin:
         return True
 
-    with st.sidebar:
-        st.markdown("### Admin login")
+    with st.sidebar.expander("Admin access", expanded=False):
+        st.caption("Lower-priority controls")
         pw = st.text_input("Password", type="password")
         if st.button("Log in"):
             secret = st.secrets.get("ADMIN_PASSWORD", "")
@@ -44,13 +44,6 @@ def check_password() -> bool:
 
 is_admin = check_password()
 
-with st.sidebar:
-    st.markdown("---")
-    st.write("Mode:", "✅ Admin (edit enabled)" if is_admin else "👀 Public (read-only)")
-    if is_admin and st.button("Log out"):
-        st.session_state.is_admin = False
-        st.rerun()
-
 # =========================
 # 2) Storage (CSV)
 # =========================
@@ -59,9 +52,8 @@ PORTFOLIO_PATH = "portfolios.csv"
 BASELINE_PATH = "baseline_lots.csv"
 
 TXN_COLS = ["txn_id", "portfolio", "date", "type", "ticker", "shares", "price", "amount"]
-PORTFOLIO_COLS = ["portfolio", "start_mode", "as_of_date", "starting_cash"]
+PORTFOLIO_COLS = ["portfolio", "start_mode", "as_of_date", "starting_cash", "credit_spread_pct"]
 VALID_MODES = ["ledger_complete", "snapshot_start"]
-# NOTE: shares_open can be POSITIVE (long) or NEGATIVE (short) for snapshot portfolios
 BASELINE_COLS = ["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shares_open"]
 
 # Transaction types:
@@ -70,8 +62,69 @@ BASELINE_COLS = ["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shar
 # - short: open/increase short (borrow+sell)
 # - cover: buy-to-cover reduce/close short
 # - dividend: cash dividend
-VALID_TXN_TYPES = ["buy", "sell", "short", "cover", "dividend"]
+# - credit_interest: cash sweep / monthly interest credit
+VALID_TXN_TYPES = ["buy", "sell", "short", "cover", "dividend", "credit_interest"]
 PORTFOLIO_MIN_DATE = date(2000, 1, 1)
+
+# Monthly auto-credit model:
+# interest for a completed month
+# = beginning_of_month_cash * max(^IRX - haircut, 0) / 12
+DEFAULT_CREDIT_SPREAD_PCT = 0.50
+IRX_PROXY_TICKER = "^IRX"
+
+SECTOR_BUCKETS = [
+    "Infrastructure",
+    "Real Estate",
+    "Technology",
+    "Media & Telecommunications",
+    "Consumer & Retail",
+    "Healthcare",
+    "Natural Resources & Energy",
+    "Industrials",
+    "Financial Institutions",
+]
+
+SECTOR_BUCKET_MAP = {
+    "real estate": "Real Estate",
+    "technology": "Technology",
+    "communication services": "Media & Telecommunications",
+    "consumer cyclical": "Consumer & Retail",
+    "consumer defensive": "Consumer & Retail",
+    "healthcare": "Healthcare",
+    "basic materials": "Natural Resources & Energy",
+    "energy": "Natural Resources & Energy",
+    "industrials": "Industrials",
+    "financial services": "Financial Institutions",
+    "utilities": "Infrastructure",
+}
+
+
+def classify_sector_bucket(sector: str, industry: str) -> str:
+    s = str(sector or "").strip().lower()
+    i = str(industry or "").strip().lower()
+
+    if s in SECTOR_BUCKET_MAP:
+        return SECTOR_BUCKET_MAP[s]
+
+    if any(k in i for k in ["bank", "insurance", "asset management", "credit", "financial"]):
+        return "Financial Institutions"
+    if any(k in i for k in ["telecom", "media", "broadcast", "entertainment", "advertising"]):
+        return "Media & Telecommunications"
+    if any(k in i for k in ["reit", "property", "real estate"]):
+        return "Real Estate"
+    if any(k in i for k in ["software", "semiconductor", "internet", "it services", "technology"]):
+        return "Technology"
+    if any(k in i for k in ["biotech", "pharma", "drug", "medical", "health"]):
+        return "Healthcare"
+    if any(k in i for k in ["oil", "gas", "mining", "metals", "chemical", "energy"]):
+        return "Natural Resources & Energy"
+    if any(k in i for k in ["airline", "aerospace", "construction", "machinery", "industrial", "transport"]):
+        return "Industrials"
+    if any(k in i for k in ["consumer", "retail", "restaurant", "apparel", "auto", "food", "beverage"]):
+        return "Consumer & Retail"
+    if any(k in i for k in ["utility", "power", "water", "infrastructure"]):
+        return "Infrastructure"
+    return "Unknown"
 
 
 def _clean_str(x) -> str:
@@ -97,6 +150,9 @@ def load_portfolios() -> pd.DataFrame:
 
     df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce")
     df["starting_cash"] = pd.to_numeric(df["starting_cash"], errors="coerce").fillna(0.0)
+    df["credit_spread_pct"] = (
+        pd.to_numeric(df["credit_spread_pct"], errors="coerce").fillna(DEFAULT_CREDIT_SPREAD_PCT)
+    )
 
     if "Main" not in set(df["portfolio"].tolist()):
         df = pd.concat(
@@ -108,6 +164,7 @@ def load_portfolios() -> pd.DataFrame:
                             "start_mode": "ledger_complete",
                             "as_of_date": pd.to_datetime(date.today()),
                             "starting_cash": 0.0,
+                            "credit_spread_pct": DEFAULT_CREDIT_SPREAD_PCT,
                         }
                     ]
                 ),
@@ -129,6 +186,9 @@ def save_portfolios(df: pd.DataFrame) -> None:
     out["as_of_date"] = pd.to_datetime(out["as_of_date"], errors="coerce")
     out.loc[out["as_of_date"].isna(), "as_of_date"] = pd.to_datetime(date.today())
     out["starting_cash"] = pd.to_numeric(out["starting_cash"], errors="coerce").fillna(0.0)
+    out["credit_spread_pct"] = (
+        pd.to_numeric(out["credit_spread_pct"], errors="coerce").fillna(DEFAULT_CREDIT_SPREAD_PCT)
+    )
     out = out[out["portfolio"].notna() & (out["portfolio"] != "")]
     out = out.drop_duplicates(subset=["portfolio"]).sort_values("portfolio")
     out.to_csv(PORTFOLIO_PATH, index=False)
@@ -167,11 +227,11 @@ def load_txns() -> pd.DataFrame:
     trades = df[is_trade].dropna(subset=["ticker", "shares", "price"]).copy()
     trades = trades[(trades["shares"] > 0) & (trades["price"] >= 0)]
 
-    divs = df[~is_trade].dropna(subset=["amount"]).copy()
-    divs = divs[divs["amount"] >= 0]
-    divs["ticker"] = divs["ticker"].fillna("").astype(str)
+    income_rows = df[~is_trade].dropna(subset=["amount"]).copy()
+    income_rows = income_rows[income_rows["amount"] >= 0]
+    income_rows["ticker"] = income_rows["ticker"].fillna("").astype(str)
 
-    out = pd.concat([trades, divs], ignore_index=True)
+    out = pd.concat([trades, income_rows], ignore_index=True)
     return out.sort_values(["portfolio", "date", "txn_id"]).reset_index(drop=True)
 
 
@@ -204,7 +264,6 @@ def load_baseline() -> pd.DataFrame:
     df["shares_open"] = pd.to_numeric(df["shares_open"], errors="coerce")
 
     df = df.dropna(subset=["lot_id", "portfolio", "ticker", "buy_date", "buy_price", "shares_open"])
-    # allow negative shares_open (short baseline), but not zero
     df = df[(df["shares_open"].abs() > 1e-12) & (df["buy_price"] >= 0)]
     return df.sort_values(["portfolio", "ticker", "buy_date", "lot_id"]).reset_index(drop=True)
 
@@ -260,10 +319,6 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
 
 
 def fetch_prices_on_or_before(tickers: list[str], d: date) -> pd.Series:
-    """
-    For each ticker, returns close price on or BEFORE date d.
-    If d is today/future, falls back to latest available close.
-    """
     cleaned = sorted(set([str(x).upper().strip() for x in tickers if str(x).strip()]))
     if not cleaned:
         return pd.Series(dtype=float)
@@ -288,9 +343,6 @@ def fetch_prices_on_or_before(tickers: list[str], d: date) -> pd.Series:
 
 @st.cache_data(ttl=1800)
 def fetch_close_on_or_before(ticker: str, d: date) -> float | None:
-    """
-    Close price on or BEFORE date d (handles weekends/holidays).
-    """
     t = str(ticker).upper().strip()
     if not t:
         return None
@@ -320,10 +372,6 @@ def fetch_close_on_or_before(ticker: str, d: date) -> float | None:
 
 @st.cache_data(ttl=3600)
 def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
-    """
-    yfinance dividends sometimes come back tz-aware; we normalize to tz-naive midnight.
-    Returns dividend per share events between [start, end].
-    """
     t = str(ticker).upper().strip()
     s = pd.to_datetime(start).normalize()
     e = pd.to_datetime(end).normalize()
@@ -348,6 +396,30 @@ def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) 
     return out.astype(float)
 
 
+@st.cache_data(ttl=3600)
+def fetch_latest_irx_rate_pct() -> float | None:
+    try:
+        data = yf.download(IRX_PROXY_TICKER, period="5d", interval="1d", auto_adjust=False, progress=False)
+        if data is None or data.empty:
+            return None
+
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            if IRX_PROXY_TICKER not in close.columns:
+                return None
+            s = close[IRX_PROXY_TICKER]
+        else:
+            s = close
+
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            return None
+
+        return float(s.iloc[-1])
+    except Exception:
+        return None
+
+
 # =========================
 # 2b) Yahoo sector/industry (cached)
 # =========================
@@ -369,11 +441,6 @@ def fetch_sector_industry(tickers: list[str]) -> pd.DataFrame:
 # 2d) Bulk upload helpers (CSV)
 # =========================
 def _parse_number_allow_parens(x):
-    """
-    Accepts numbers like:
-      10, -10, (10), "  (10)  "
-    Returns float or np.nan.
-    """
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
     s = str(x).strip()
@@ -399,11 +466,11 @@ def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
       TICKER | TRANSACTION TYPE | DATE | SHARE COUNT
 
     Optional columns:
-      PRICE   (if omitted/blank => filled from Yahoo close-on-or-before date)
+      PRICE
 
     Returns normalized df:
       ticker, type, date, shares, price
-    Only keeps type in {buy, sell, short, cover}.
+    Only keeps trade type in {buy, sell, short, cover}.
     """
     df = pd.read_csv(uploaded_file)
     df.columns = [str(c).strip().upper() for c in df.columns]
@@ -434,13 +501,6 @@ def parse_simple_txn_csv(uploaded_file) -> pd.DataFrame:
 
 
 def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Ensures there is a valid 'price' for every row.
-    - If import_df has a non-null price, we keep it.
-    - Otherwise we fetch close-on-or-before (ticker, date).
-
-    Returns: (good_df, bad_df)
-    """
     if import_df is None or import_df.empty:
         return import_df, pd.DataFrame()
 
@@ -474,16 +534,69 @@ def enrich_import_with_prices(import_df: pd.DataFrame) -> tuple[pd.DataFrame, pd
     return good, bad
 
 
+def parse_credit_interest_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Required columns:
+      MONTH | AMOUNT
+
+    Optional columns:
+      TICKER
+
+    Returns (good, bad):
+      good columns: date, amount, ticker
+      bad includes original values + reason
+    """
+    df = pd.read_csv(uploaded_file)
+    df.columns = [str(c).strip().upper() for c in df.columns]
+
+    required = ["MONTH", "AMOUNT"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    work = pd.DataFrame()
+    work["month_raw"] = df["MONTH"].astype(str).str.strip()
+    work["amount_raw"] = df["AMOUNT"]
+    work["ticker"] = (
+        df["TICKER"].astype(str).str.upper().str.strip() if "TICKER" in df.columns else ""
+    )
+
+    month_str = work["month_raw"].astype(str).str.replace(r"[/.]", "-", regex=True)
+    parsed_month = pd.to_datetime(month_str, errors="coerce")
+    month_is_yyyy_mm = month_str.str.match(r"^\d{4}-\d{2}$")
+    parsed_month = parsed_month.where(~month_is_yyyy_mm, pd.to_datetime(month_str + "-01", errors="coerce"))
+
+    work["date"] = parsed_month.dt.to_period("M").dt.to_timestamp()
+    work["amount"] = pd.to_numeric(work["amount_raw"].apply(_parse_number_allow_parens), errors="coerce")
+
+    bad_reasons = []
+    for _, r in work.iterrows():
+        if pd.isna(r["date"]):
+            bad_reasons.append("Invalid MONTH (use YYYY-MM)")
+        elif pd.isna(r["amount"]):
+            bad_reasons.append("Invalid AMOUNT")
+        elif float(r["amount"]) < 0:
+            bad_reasons.append("AMOUNT must be >= 0")
+        else:
+            bad_reasons.append("")
+
+    work["reason"] = bad_reasons
+    good = work.loc[work["reason"] == "", ["date", "amount", "ticker"]].copy()
+    bad = work.loc[work["reason"] != "", ["month_raw", "amount_raw", "ticker", "reason"]].copy()
+    bad = bad.rename(columns={"month_raw": "MONTH", "amount_raw": "AMOUNT", "ticker": "TICKER"})
+
+    good["amount"] = pd.to_numeric(good["amount"], errors="coerce")
+    good["ticker"] = good["ticker"].fillna("").astype(str)
+    good = good.dropna(subset=["date", "amount"])
+    good = good[good["amount"] >= 0].reset_index(drop=True)
+    bad = bad.reset_index(drop=True)
+    return good, bad
+
+
 # =========================
 # 3) Lot engine + accounting (LONG + SHORT)
 # =========================
 def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, side: str):
-    """
-    Reduce existing exposure by matching lots.
-
-    side="LONG": reduce positive shares by consuming positive lots toward 0
-    side="SHORT": reduce short by consuming negative lots toward 0 (increase toward 0)
-    """
     realized_rows = []
     remaining = float(reduce_shares)
 
@@ -506,7 +619,7 @@ def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, si
             remaining -= take
             realized_rows.append((lot, take))
 
-        else:  # SHORT
+        else:
             if sh_open >= -1e-12:
                 i += 1
                 continue
@@ -522,14 +635,6 @@ def apply_reduce_to_lots(lots: list[dict], reduce_shares: float, method: str, si
 
 
 def build_lots_with_baseline(trades: pd.DataFrame, baseline: pd.DataFrame, method: str):
-    """
-    Lots support:
-      - shares_open > 0 : long lots (entry = buy_price)
-      - shares_open < 0 : short lots (entry = short_price stored in buy_price)
-    Realized PnL:
-      - LONG: shares_sold * (sell_price - entry)
-      - SHORT: shares_covered * (entry - cover_price)
-    """
     open_cols = ["lot_id", "ticker", "buy_date", "buy_price", "shares_open"]
     real_cols = [
         "sale_id",
@@ -641,7 +746,7 @@ def cash_delta(row: pd.Series) -> float:
         return +float(row["shares"]) * float(row["price"])
     if typ == "cover":
         return -float(row["shares"]) * float(row["price"])
-    if typ == "dividend":
+    if typ in ["dividend", "credit_interest"]:
         return +float(row["amount"])
     return 0.0
 
@@ -649,10 +754,172 @@ def cash_delta(row: pd.Series) -> float:
 def get_portfolio_meta(portfolios_df: pd.DataFrame, portfolio: str):
     r = portfolios_df.loc[portfolios_df["portfolio"] == portfolio].iloc[0]
     return {
+        "portfolio": str(portfolio),
         "start_mode": str(r["start_mode"]),
         "as_of_date": pd.to_datetime(r["as_of_date"]),
         "starting_cash": float(r["starting_cash"]),
+        "credit_spread_pct": float(r.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT)),
     }
+
+
+def _cash_start_boundary(meta: dict, txns: pd.DataFrame) -> pd.Timestamp:
+    as_of = pd.to_datetime(meta["as_of_date"]).normalize()
+
+    if meta["start_mode"] == "snapshot_start":
+        return as_of
+
+    if txns is None or txns.empty:
+        return as_of
+
+    d = pd.to_datetime(txns["date"], errors="coerce").dropna()
+    if d.empty:
+        return as_of
+
+    return min(as_of, d.min().normalize())
+
+
+def build_auto_credit_interest_txns(
+    portfolio_meta: dict,
+    portfolio_txns_all: pd.DataFrame,
+    valuation_date: date | None = None,
+) -> pd.DataFrame:
+    eval_date = pd.to_datetime(valuation_date if valuation_date is not None else date.today()).normalize()
+    txns = portfolio_txns_all.copy()
+
+    if txns.empty:
+        txns = pd.DataFrame(columns=TXN_COLS)
+    else:
+        txns["date"] = pd.to_datetime(txns["date"], errors="coerce")
+        txns = txns.dropna(subset=["date"]).copy()
+        txns = txns[txns["date"] <= eval_date].copy()
+
+    start_boundary = _cash_start_boundary(portfolio_meta, txns)
+
+    if portfolio_meta["start_mode"] == "snapshot_start" and not txns.empty:
+        txns = txns[txns["date"] >= pd.to_datetime(portfolio_meta["as_of_date"]).normalize()].copy()
+
+    if eval_date < start_boundary:
+        return pd.DataFrame(columns=TXN_COLS)
+
+    months = pd.period_range(start=start_boundary.to_period("M"), end=eval_date.to_period("M"), freq="M")
+    months = [m for m in months if m.end_time.normalize() <= eval_date]
+
+    if not months:
+        return pd.DataFrame(columns=TXN_COLS)
+
+    if txns.empty:
+        work = pd.DataFrame(columns=TXN_COLS + ["month"])
+    else:
+        work = txns.copy()
+        work["month"] = pd.to_datetime(work["date"]).dt.to_period("M")
+
+    manual_credit_months = set()
+    if not work.empty:
+        manual_credit_months = set(work.loc[work["type"] == "credit_interest", "month"].tolist())
+
+    running_cash = float(portfolio_meta["starting_cash"])
+    auto_rows = []
+
+    irx_rate_pct = fetch_latest_irx_rate_pct()
+    if irx_rate_pct is None or not np.isfinite(irx_rate_pct):
+        return pd.DataFrame(columns=TXN_COLS)
+
+    haircut_pct = float(portfolio_meta.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT))
+    implied_annual_rate_pct = max(irx_rate_pct - haircut_pct, 0.0)
+
+    for month in months:
+        month_txns = (
+            work[work["month"] == month].sort_values(["date", "txn_id"])
+            if not work.empty
+            else pd.DataFrame()
+        )
+        month_start_cash = running_cash
+        month_had_auto = False
+
+        if month not in manual_credit_months and month_start_cash > 1e-12:
+            interest_amt = round(month_start_cash * (implied_annual_rate_pct / 100.0) / 12.0, 2)
+
+            if interest_amt > 0:
+                month_end = month.end_time.normalize()
+                auto_rows.append(
+                    {
+                        "txn_id": f"auto_credit_interest__{portfolio_meta['portfolio']}__{month.strftime('%Y%m')}",
+                        "portfolio": portfolio_meta["portfolio"],
+                        "date": month_end,
+                        "type": "credit_interest",
+                        "ticker": "",
+                        "shares": np.nan,
+                        "price": np.nan,
+                        "amount": float(interest_amt),
+                    }
+                )
+                month_had_auto = True
+
+        if month_txns is not None and not month_txns.empty:
+            running_cash += float(month_txns.apply(cash_delta, axis=1).sum())
+
+        if month_had_auto:
+            running_cash += float(auto_rows[-1]["amount"])
+
+    if not auto_rows:
+        return pd.DataFrame(columns=TXN_COLS)
+
+    auto_df = pd.DataFrame(auto_rows, columns=TXN_COLS)
+    auto_df["date"] = pd.to_datetime(auto_df["date"])
+    return auto_df
+
+
+def build_effective_txns(
+    portfolio_meta: dict,
+    portfolio_txns_all: pd.DataFrame,
+    valuation_date: date | None = None,
+) -> pd.DataFrame:
+    base = portfolio_txns_all.copy()
+    if base.empty:
+        base = pd.DataFrame(columns=TXN_COLS)
+    else:
+        base["date"] = pd.to_datetime(base["date"], errors="coerce")
+
+    auto_df = build_auto_credit_interest_txns(
+        portfolio_meta=portfolio_meta,
+        portfolio_txns_all=base,
+        valuation_date=valuation_date,
+    )
+
+    out = pd.concat([base, auto_df], ignore_index=True)
+    if out.empty:
+        return out
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date", "type"]).copy()
+    out = out.sort_values(["date", "txn_id"]).reset_index(drop=True)
+    return out
+
+
+def build_monthly_credit_income_report(effective_txns: pd.DataFrame) -> pd.DataFrame:
+    if effective_txns is None or effective_txns.empty:
+        return pd.DataFrame(columns=["month", "manual_credit_income", "auto_credit_income", "total_credit_income"])
+
+    tx = effective_txns.copy()
+    tx["date"] = pd.to_datetime(tx["date"], errors="coerce")
+    tx = tx.dropna(subset=["date"])
+    tx = tx[tx["type"] == "credit_interest"].copy()
+    if tx.empty:
+        return pd.DataFrame(columns=["month", "manual_credit_income", "auto_credit_income", "total_credit_income"])
+
+    tx["month"] = tx["date"].dt.to_period("M").dt.to_timestamp()
+    tx["amount"] = pd.to_numeric(tx["amount"], errors="coerce").fillna(0.0)
+    tx["source"] = np.where(tx["txn_id"].astype(str).str.startswith("auto_credit_interest__"), "auto", "manual")
+
+    grouped = tx.groupby(["month", "source"], as_index=False)["amount"].sum()
+    pivot = grouped.pivot(index="month", columns="source", values="amount").fillna(0.0)
+    pivot = pivot.rename(columns={"manual": "manual_credit_income", "auto": "auto_credit_income"})
+    for c in ["manual_credit_income", "auto_credit_income"]:
+        if c not in pivot.columns:
+            pivot[c] = 0.0
+    pivot["total_credit_income"] = pivot["manual_credit_income"] + pivot["auto_credit_income"]
+    out = pivot.reset_index().sort_values("month", ascending=False)
+    return out[["month", "manual_credit_income", "auto_credit_income", "total_credit_income"]]
 
 
 def validate_candidate_state(
@@ -661,32 +928,34 @@ def validate_candidate_state(
     portfolio_baseline: pd.DataFrame,
     method: str,
 ) -> tuple[bool, str]:
-    """
-    Rules:
-    - Snapshot portfolios: no txns before as_of_date
-    - No negative CASH (still enforced: no margin loans)
-    - SELL can only reduce existing LONG shares
-    - COVER can only reduce existing SHORT shares
-    - SHORT can open/increase shorts (no cap here; cash constraint still applies)
-    """
-    start_mode = portfolio_meta["start_mode"]
-    as_of = pd.to_datetime(portfolio_meta["as_of_date"])
-    starting_cash = float(portfolio_meta["starting_cash"])
-
     txns = portfolio_txns_all.copy()
     if not txns.empty:
-        txns["date"] = pd.to_datetime(txns["date"])
-        txns = txns.sort_values(["date", "txn_id"])
+        txns["date"] = pd.to_datetime(txns["date"], errors="coerce")
+        txns = txns.dropna(subset=["date"]).copy()
+
+    start_mode = portfolio_meta["start_mode"]
+    as_of = pd.to_datetime(portfolio_meta["as_of_date"]).normalize()
 
     if start_mode == "snapshot_start" and not txns.empty:
         if (txns["date"] < as_of).any():
             return False, f"Snapshot portfolios cannot have transactions before as-of date ({as_of.date()})."
 
-    cash = starting_cash
-    for _, r in txns.iterrows():
-        cash += cash_delta(r)
-        if cash < -1e-9:
-            return False, "Invalid: cash would go negative (margin not allowed)."
+    validation_date = date.today()
+    if not txns.empty:
+        validation_date = pd.to_datetime(txns["date"]).max().date()
+
+    effective_txns = build_effective_txns(
+        portfolio_meta=portfolio_meta,
+        portfolio_txns_all=txns,
+        valuation_date=validation_date,
+    )
+
+    cash = float(portfolio_meta["starting_cash"])
+    if not effective_txns.empty:
+        for _, r in effective_txns.sort_values(["date", "txn_id"]).iterrows():
+            cash += cash_delta(r)
+            if cash < -1e-9:
+                return False, "Invalid: cash would go negative (margin not allowed)."
 
     trades = txns[txns["type"].isin(["buy", "sell", "short", "cover"])].copy()
     if trades.empty:
@@ -714,7 +983,7 @@ def validate_candidate_state(
 
         elif typ == "sell":
             if long_shares.get(t, 0.0) + 1e-12 < sh:
-                return False, f"Invalid SELL: not enough LONG shares of {t} to sell {sh:.3f}."
+                return False, f"Invalid SELL: not enough LONG shares of {t} to sell {sh:.4f}."
             long_shares[t] -= sh
 
         elif typ == "short":
@@ -722,7 +991,7 @@ def validate_candidate_state(
 
         elif typ == "cover":
             if short_shares.get(t, 0.0) + 1e-12 < sh:
-                return False, f"Invalid COVER: not enough SHORT shares of {t} to cover {sh:.3f}."
+                return False, f"Invalid COVER: not enough SHORT shares of {t} to cover {sh:.4f}."
             short_shares[t] -= sh
 
     return True, ""
@@ -741,7 +1010,12 @@ def portfolio_snapshot(
 
     eval_date = pd.to_datetime(valuation_date if valuation_date is not None else date.today()).normalize()
 
-    df = txns.copy()
+    df = build_effective_txns(
+        portfolio_meta=portfolio_meta,
+        portfolio_txns_all=txns,
+        valuation_date=eval_date.date(),
+    )
+
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"])
         df = df[df["date"] <= eval_date].copy()
@@ -840,12 +1114,18 @@ def compute_nav_series_for_portfolio(
     txns_all: pd.DataFrame,
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
-    chart_freq: str,  # "D" or "W-MON"
+    chart_freq: str,
 ) -> pd.Series:
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
-    txns = txns_all[txns_all["portfolio"] == pname].copy()
+    base_txns = txns_all[txns_all["portfolio"] == pname].copy()
+    txns = build_effective_txns(
+        portfolio_meta=meta,
+        portfolio_txns_all=base_txns,
+        valuation_date=end.date(),
+    )
+
     if not txns.empty:
         txns["date"] = pd.to_datetime(txns["date"]).dt.normalize()
         txns = txns.sort_values(["date", "txn_id"])
@@ -1015,9 +1295,6 @@ def rolling_beta_alpha(port_nav: pd.Series, mkt_px: pd.Series, window: int = 26)
 
 
 def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    For portfolios with shorts, signed MV can be negative, so allocations use ABS exposure.
-    """
     rows = []
 
     if not snap["holdings"].empty:
@@ -1044,16 +1321,29 @@ def build_allocation_tables(snap: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df.loc[df["label"] == "CASH", "industry"] = "Cash"
     df["sector"] = df["sector"].fillna("Unknown")
     df["industry"] = df["industry"].fillna("Unknown")
+    df["ticker_display"] = np.where(df["label"] == "CASH", "CASH", df["ticker"])
+    df["sector_bucket"] = [classify_sector_bucket(s, i) for s, i in zip(df["sector"], df["industry"]) ]
+    df.loc[df["label"] == "CASH", "sector_bucket"] = "Cash"
 
     sector_alloc = (
-        df.groupby(["sector"], as_index=False).agg(exposure=("exposure", "sum")).sort_values("exposure", ascending=False)
+        df.groupby(["sector_bucket"], as_index=False)
+        .agg(exposure=("exposure", "sum"))
+        .rename(columns={"sector_bucket": "sector"})
+        .sort_values("exposure", ascending=False)
     )
     sector_total = float(sector_alloc["exposure"].sum())
     sector_alloc["weight"] = np.where(sector_total > 0, sector_alloc["exposure"] / sector_total, 0.0)
 
     industry_alloc = (
-        df.groupby(["sector", "industry"], as_index=False)
-        .agg(exposure=("exposure", "sum"))
+        df.groupby(["sector_bucket", "industry"], as_index=False)
+        .agg(
+            exposure=("exposure", "sum"),
+            tickers=(
+                "ticker_display",
+                lambda s: ", ".join(sorted({str(t).strip() for t in s if str(t).strip()})),
+            ),
+        )
+        .rename(columns={"sector_bucket": "sector"})
         .sort_values(["sector", "exposure"], ascending=[True, False])
     )
     ind_total = float(industry_alloc["exposure"].sum())
@@ -1081,16 +1371,16 @@ def build_contribution_table(snap: dict) -> pd.DataFrame:
             realized_cost_basis=("realized_cost_basis", "sum"),
         )
 
-    divs = pd.DataFrame(columns=["ticker", "dividend_pnl"])
+    cash_income = pd.DataFrame(columns=["ticker", "dividend_pnl"])
     tx = snap["filtered_txns"]
     if tx is not None and not tx.empty:
-        d = tx[tx["type"] == "dividend"].copy()
+        d = tx[tx["type"].isin(["dividend", "credit_interest"])].copy()
         if not d.empty:
             d["ticker"] = d["ticker"].fillna("").astype(str).str.upper().str.strip()
             d.loc[d["ticker"] == "", "ticker"] = "CASH"
-            divs = d.groupby("ticker", as_index=False).agg(dividend_pnl=("amount", "sum"))
+            cash_income = d.groupby("ticker", as_index=False).agg(dividend_pnl=("amount", "sum"))
 
-    out = unreal.merge(realized, on="ticker", how="outer").merge(divs, on="ticker", how="outer")
+    out = unreal.merge(realized, on="ticker", how="outer").merge(cash_income, on="ticker", how="outer")
     if out.empty:
         return out
 
@@ -1122,7 +1412,6 @@ def build_contribution_table(snap: dict) -> pd.DataFrame:
 
 
 def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) -> pd.DataFrame:
-def build_price_breakdown_table(snap: dict) -> pd.DataFrame:
     entry_rows = []
 
     if snap.get("lots") is not None and not snap["lots"].empty:
@@ -1146,7 +1435,11 @@ def build_price_breakdown_table(snap: dict) -> pd.DataFrame:
             entry.groupby("ticker", as_index=False)
             .agg(total_shares=("shares_ref", "sum"), weighted=("weighted", "sum"))
         )
-        buy_avg["avg_buy_price"] = np.where(buy_avg["total_shares"] > 0, buy_avg["weighted"] / buy_avg["total_shares"], np.nan)
+        buy_avg["avg_buy_price"] = np.where(
+            buy_avg["total_shares"] > 0,
+            buy_avg["weighted"] / buy_avg["total_shares"],
+            np.nan,
+        )
         buy_avg = buy_avg[["ticker", "avg_buy_price"]]
     else:
         buy_avg = pd.DataFrame(columns=["ticker", "avg_buy_price"])
@@ -1172,7 +1465,9 @@ def build_price_breakdown_table(snap: dict) -> pd.DataFrame:
     else:
         sold_avg = pd.DataFrame(columns=["ticker", "avg_sold_price"])
 
-    tickers = set(buy_avg.get("ticker", pd.Series(dtype=str)).tolist()) | set(sold_avg.get("ticker", pd.Series(dtype=str)).tolist())
+    tickers = set(buy_avg.get("ticker", pd.Series(dtype=str)).tolist()) | set(
+        sold_avg.get("ticker", pd.Series(dtype=str)).tolist()
+    )
     tx = snap.get("filtered_txns")
     if tx is not None and not tx.empty:
         tx_tickers = tx[tx["type"].isin(["buy", "sell", "short", "cover"])]["ticker"].astype(str).str.upper().str.strip()
@@ -1187,19 +1482,32 @@ def build_price_breakdown_table(snap: dict) -> pd.DataFrame:
 
     eval_date = valuation_date if valuation_date is not None else date.today()
     live = fetch_prices_on_or_before(tickers, eval_date)
-    live = fetch_last_prices(tickers)
     out["current_price"] = out["ticker"].map(live)
 
     return out.sort_values("ticker").reset_index(drop=True)
 
 
 def render_sector_pie(sector_alloc: pd.DataFrame, title: str):
-    if sector_alloc.empty or sector_alloc["exposure"].sum() <= 0:
+    plot_df = sector_alloc.copy()
+    plot_df["exposure"] = pd.to_numeric(plot_df["exposure"], errors="coerce").fillna(0.0)
+    plot_df = plot_df[plot_df["exposure"] > 1e-12].copy()
+
+    if plot_df.empty or plot_df["exposure"].sum() <= 0:
         st.info("No sector allocation available yet.")
         return
-    fig, ax = plt.subplots()
-    ax.pie(sector_alloc["exposure"], labels=sector_alloc["sector"], autopct="%1.1f%%", startangle=90)
-    ax.set_title(title)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.pie(
+        plot_df["exposure"],
+        labels=plot_df["sector"],
+        autopct="%1.1f%%",
+        startangle=90,
+        pctdistance=0.78,
+        labeldistance=1.14,
+        textprops={"fontsize": 9},
+    )
+    ax.set_title(title, pad=24)
+    fig.subplots_adjust(top=0.80)
     ax.axis("equal")
     st.pyplot(fig, clear_figure=True)
 
@@ -1214,10 +1522,6 @@ def compute_daily_shares_df(
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """
-    Daily NET shares outstanding by ticker from start boundary to end_date.
-    Shorts are negative shares; dividend accrual uses max(shares, 0) (i.e., ignores borrow costs).
-    """
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
     idx = pd.date_range(start=start, end=end, freq="D")
@@ -1291,10 +1595,6 @@ def compute_dividend_accrual_quarterly(
     baseline_all: pd.DataFrame,
     end_date: pd.Timestamp,
 ) -> dict:
-    """
-    Uses yfinance dividend-per-share events and multiplies by LONG shares held on that date.
-    (Short borrow costs / dividend-in-lieu are not modeled.)
-    """
     start = _portfolio_start_date(meta)
     end = pd.to_datetime(end_date).normalize()
 
@@ -1363,6 +1663,7 @@ if not txns_all.empty:
                     "start_mode": "ledger_complete",
                     "as_of_date": pd.to_datetime(date.today()),
                     "starting_cash": 0.0,
+                    "credit_spread_pct": DEFAULT_CREDIT_SPREAD_PCT,
                 }
                 for p in missing
             ]
@@ -1376,14 +1677,180 @@ portfolio_names = portfolios_df["portfolio"].tolist()
 # 6) UI
 # =========================
 st.title("Brown Investment Group Portfolio")
-st.caption("Public view is read-only. Admin can edit portfolios, baseline lots, and transactions.")
+st.markdown(
+    """
+    <style>
+        .main .block-container {
+            max-width: 1520px;
+            padding-top: 1.25rem;
+            padding-bottom: 1.25rem;
+        }
+        .appbar {
+            border: 1px solid rgba(99, 115, 129, 0.35);
+            border-radius: 12px;
+            background: linear-gradient(180deg, rgba(20,25,32,0.95), rgba(16,20,26,0.95));
+            color: #F3F6FA;
+            padding: 12px 16px;
+            margin-bottom: 16px;
+        }
+        .appbar-grid {
+            display: grid;
+            grid-template-columns: 1.7fr 1.3fr;
+            gap: 16px;
+            align-items: center;
+        }
+        .appbar-title { font-size: 1.05rem; font-weight: 700; margin: 0; }
+        .appbar-sub { font-size: 0.78rem; color: #9AA4B2; margin: 2px 0 0 0; }
+        .status-badge {
+            display: inline-block;
+            font-size: 0.72rem;
+            border: 1px solid rgba(73, 206, 255, 0.5);
+            color: #7FDBFF;
+            border-radius: 999px;
+            padding: 2px 8px;
+            margin-left: 8px;
+        }
+        .filter-bar {
+            position: sticky;
+            top: 0.5rem;
+            z-index: 10;
+            background: rgba(11,16,23,0.95);
+            border: 1px solid rgba(99,115,129,0.3);
+            border-radius: 12px;
+            color: #F3F6FA;
+            padding: 8px 12px;
+            margin-bottom: 16px;
+        }
+        .kpi-section-title {
+            color: #9AA4B2;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin: 14px 0 6px;
+            font-weight: 600;
+        }
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4,minmax(0,1fr));
+            gap: 12px;
+            margin: 0 0 14px;
+        }
+        .kpi-card {
+            border: 1px solid rgba(99,115,129,0.35);
+            border-radius: 12px;
+            padding: 12px;
+            background: rgba(21,27,36,0.92);
+            color: #F3F6FA;
+        }
+        .kpi-label { font-size: 0.74rem; color: #9AA4B2; text-transform: uppercase; letter-spacing: 0.05em; }
+        .kpi-value { font-size: 1.35rem; font-weight: 700; margin: 6px 0; }
+        .kpi-delta-pos { color: #37C48B; font-size: 0.82rem; }
+        .kpi-delta-neg { color: #FF6B6B; font-size: 0.82rem; }
+        .kpi-note { color: #9AA4B2; font-size: 0.75rem; margin-top: 4px; }
+        @media (max-width: 1200px) {
+            .kpi-grid { grid-template-columns: repeat(3,minmax(0,1fr)); }
+        }
+        @media (max-width: 900px) {
+            .kpi-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+        }
+        @media (max-width: 620px) {
+            .kpi-grid { grid-template-columns: 1fr; }
+        }
+        .page-title { font-size: 1.5rem; font-weight: 700; margin: 4px 0 0; }
+        .page-subtitle { color: #9AA4B2; margin-top: 2px; }
+        .review-box {
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 0.75rem;
+            padding: 0.75rem 0.95rem;
+            background: rgba(30, 38, 52, 0.45);
+            color: #F3F6FA;
+            margin-bottom: 0.8rem;
+        }
+        .review-box h4 {
+            margin: 0 0 0.4rem 0;
+            font-size: 1rem;
+        }
+        .review-box ul {
+            margin: 0;
+            padding-left: 1.1rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.sidebar.header("Settings")
-match_method = st.sidebar.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
-analyze_on_date = st.sidebar.date_input("Analyze on date", value=date.today())
 
-freq_choice = st.sidebar.selectbox("Chart frequency", ["Weekly (Mon)", "Daily"], index=0)
+def _fmt_delta(v: float | None) -> str:
+    if v is None or pd.isna(v):
+        return "N/A"
+    return f"{v*100:+.2f}%"
+
+
+def render_kpi_cards(items: list[dict]) -> None:
+    cards = []
+    for item in items:
+        delta = item.get("delta")
+        delta_label = item.get("delta_label")
+        delta_line = ""
+        if delta_label and delta is not None and pd.notna(delta):
+            delta_class = "kpi-delta-pos" if delta >= 0 else "kpi-delta-neg"
+            delta_line = f"<div class='{delta_class}'>{delta_label}: {_fmt_delta(delta)}</div>"
+
+        cards.append(
+            (
+                "<div class='kpi-card'>"
+                f"<div class='kpi-label'>{item['label']}</div>"
+                f"<div class='kpi-value'>{item['value']}</div>"
+                f"{delta_line}"
+                f"<div class='kpi-note'>{item.get('note', '')}</div>"
+                "</div>"
+            )
+        )
+    st.markdown(f"<div class='kpi-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
+
+
+def render_kpi_sections(sections: list[dict]) -> None:
+    for section in sections:
+        st.markdown(f"<div class='kpi-section-title'>{section['title']}</div>", unsafe_allow_html=True)
+        render_kpi_cards(section["items"])
+
+with st.sidebar:
+    st.header("Navigation")
+    nav_focus = st.radio("Primary area", ["Overview", "Portfolios", "Admin"], horizontal=True)
+    with st.expander("Filters", expanded=True):
+        analyze_on_date = st.date_input(
+            "Analyze on date",
+            value=date.today(),
+            key="sidebar_analyze_on_date",
+            help="All holdings, P&L, NAV, and contribution analytics are evaluated as of this date.",
+        )
+        match_method = st.selectbox("Sell matching", ["FIFO", "LIFO"], index=0)
+        freq_choice = st.selectbox("Chart frequency", ["Weekly (Mon)", "Daily"], index=0)
+    with st.expander("Admin", expanded=False):
+        st.write("Mode:", "✅ Admin (edit enabled)" if is_admin else "👀 Public (read-only)")
+        if is_admin and st.button("Log out"):
+            st.session_state.is_admin = False
+            st.rerun()
+
 chart_freq = "W-MON" if freq_choice.startswith("Weekly") else "D"
+
+st.markdown(
+    f"""
+    <div class='appbar'>
+        <div class='appbar-grid'>
+            <div>
+                <p class='appbar-title'>🏛️ Brown Investment Group Portfolio Platform <span class='status-badge'>{'ADMIN' if is_admin else 'PUBLIC'}</span></p>
+                <p class='appbar-sub'>Institutional multi-portfolio analytics • Last updated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}</p>
+            </div>
+            <div style='text-align:right;color:#9AA4B2;'>
+                ⤓ Export&nbsp;&nbsp;&nbsp;↗ Share&nbsp;&nbsp;&nbsp;⚙ Settings&nbsp;&nbsp;&nbsp;👤 User
+            </div>
+        </div>
+    </div>
+    <div class='filter-bar'><b>Sticky filters:</b> Portfolio scope: {nav_focus} &nbsp;|&nbsp; Analyze date: {analyze_on_date} &nbsp;|&nbsp; Frequency: {freq_choice} &nbsp;|&nbsp; Benchmark: SPY</div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ---------- Public view ----------
 st.subheader("Public View (read-only)")
@@ -1401,7 +1868,9 @@ def render_public_portfolio(
     p_base = baseline_all[baseline_all["portfolio"] == pname].copy()
 
     snap = portfolio_snapshot(meta, p_txns, p_base, match_method, valuation_date=analyze_date)
+    credit_income_report = build_monthly_credit_income_report(snap["filtered_txns"])
 
+    st.markdown(f"<div class='page-title'>{pname}</div><div class='page-subtitle'>Portfolio drill-down workspace for performance, attribution, income, risk, and positions.</div>", unsafe_allow_html=True)
     if snap["start_mode"] == "snapshot_start":
         st.info(
             f"Snapshot portfolio — tracking boundary starts {snap['as_of'].date()}. "
@@ -1410,124 +1879,259 @@ def render_public_portfolio(
     else:
         st.caption("Ledger-complete portfolio — metrics reflect your ledger as entered.")
 
+    with st.expander("How to read this portfolio", expanded=False):
+        st.markdown(
+            """
+            <div class="review-box">
+                <ul>
+                    <li><b>Health:</b> Start with value, cash, and liquidity metrics.</li>
+                    <li><b>Performance:</b> Compare NAV trajectory vs benchmark and drawdown.</li>
+                    <li><b>Drivers:</b> Use contribution tables for sector and position effects.</li>
+                    <li><b>Risk:</b> Review beta, concentration, volatility proxies, and exposures.</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    def _period_return(nav_s: pd.Series | None, lookback_days: int | None = None) -> float:
+        if nav_s is None:
+            return np.nan
+        s = nav_s.dropna().sort_index()
+        if s.empty:
+            return np.nan
+
+        end_val = float(s.iloc[-1])
+        if abs(end_val) < 1e-12:
+            return np.nan
+
+        if lookback_days is None:
+            start_val = float(s.iloc[0])
+        else:
+            cutoff = s.index.max() - pd.Timedelta(days=lookback_days)
+            hist = s[s.index <= cutoff]
+            if hist.empty:
+                return np.nan
+            start_val = float(hist.iloc[-1])
+
+        if abs(start_val) < 1e-12:
+            return np.nan
+        return (end_val / start_val) - 1.0
+
     st.caption(f"Analysis date: **{pd.to_datetime(analyze_date).date().isoformat()}**")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Starting Cash", f"${snap['starting_cash']:,.2f}")
-    c2.metric("Cash", f"${snap['cash']:,.2f}")
-    c3.metric("Market Value (signed)", f"${snap['market_value']:,.2f}")
-    c4.metric("NAV", f"${snap['nav']:,.2f}")
-
-    d1, d2 = st.columns(2)
-    d1.metric("Unrealized P&L", f"${snap['unrealized_pnl']:,.2f}")
-    d2.metric("Realized P&L", f"${snap['realized_pnl']:,.2f}")
-
+    credit_income_total = float(credit_income_report["total_credit_income"].sum()) if not credit_income_report.empty else 0.0
     divpack = compute_dividend_accrual_quarterly(pname, meta, txns_all, baseline_all, pd.to_datetime(analyze_date))
-    st.metric("Dividends (estimated, quarterly accrual)", f"${float(divpack['total']):,.2f}")
 
-    st.divider()
-    st.markdown("## Tier 1 Analytics")
+    total_return = _period_return(nav_series, None)
+    one_year_return = _period_return(nav_series, 365)
+    quarterly_return = _period_return(nav_series, 90)
 
-    sector_alloc, industry_alloc = build_allocation_tables(snap)
-    a1, a2 = st.columns([1, 1])
-    with a1:
-        st.markdown("### Sector allocation (ABS exposure incl. cash)")
-        render_sector_pie(sector_alloc, f"{pname} — Sector Exposure (Abs)")
-        st.dataframe(
-            sector_alloc.assign(weight_pct=(sector_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
-            use_container_width=True,
-        )
-    with a2:
-        st.markdown("### Sector → Industry breakdown (ABS exposure, Yahoo Finance)")
-        st.dataframe(
-            industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
-            use_container_width=True,
-        )
+    nav_change_1p = np.nan
+    if nav_series is not None:
+        nav_points = nav_series.dropna().sort_index()
+        if len(nav_points) >= 2:
+            prev_nav = float(nav_points.iloc[-2])
+            curr_nav = float(nav_points.iloc[-1])
+            if abs(prev_nav) > 1e-12:
+                nav_change_1p = (curr_nav / prev_nav) - 1.0
 
-    st.markdown("### Contribution to return (P&L contribution by ticker)")
-    contrib = build_contribution_table(snap)
-    if contrib.empty:
-        st.info("No contribution data yet (need holdings and/or sells/covers/dividends).")
-    else:
-        show_contrib = contrib.copy()
-        for col in ["unrealized_return_pct", "realized_return_pct"]:
-            show_contrib[col] = pd.to_numeric(show_contrib[col], errors="coerce")
-            show_contrib[col] = show_contrib[col].map(lambda x: f"{x:,.2f}%" if pd.notna(x) else "N/A")
-        st.dataframe(show_contrib, use_container_width=True)
-        chart_df = contrib.set_index("ticker")[["total_contribution"]]
-        st.bar_chart(chart_df)
+    current_dd = np.nan
+    if nav_series is not None and not nav_series.dropna().empty:
+        dd_now = compute_drawdown(nav_series).dropna()
+        if not dd_now.empty:
+            current_dd = float(dd_now.iloc[-1])
+    kpi_sections = [
+        {
+            "title": "Portfolio health",
+            "items": [
+                {"label": "Portfolio Value", "value": f"${float(snap['nav']):,.0f}", "delta": nav_change_1p, "delta_label": "vs previous period", "note": "Net asset value"},
+                {"label": "Cash", "value": f"${float(snap['cash']):,.0f}", "note": "Available liquidity"},
+                {"label": "Drawdown", "value": f"{current_dd*100:,.2f}%" if pd.notna(current_dd) else "N/A", "note": "From peak NAV"},
+                {"label": "Unrealized Gain", "value": f"${float(snap['unrealized_pnl']):,.0f}", "note": "Open positions"},
+            ],
+        },
+        {
+            "title": "Performance",
+            "items": [
+                {"label": "Total Return", "value": f"{total_return*100:,.2f}%" if pd.notna(total_return) else "N/A", "note": "Since inception"},
+                {"label": "1Y Return", "value": f"{one_year_return*100:,.2f}%" if pd.notna(one_year_return) else "N/A", "note": "Trailing 12 months"},
+                {"label": "Quarterly Return", "value": f"{quarterly_return*100:,.2f}%" if pd.notna(quarterly_return) else "N/A", "note": "Trailing quarter"},
+                {"label": "Realized Gain", "value": f"${float(snap['realized_pnl']):,.0f}", "note": "Closed positions"},
+            ],
+        },
+        {
+            "title": "Income",
+            "items": [
+                {"label": "Dividends", "value": f"${float(divpack['total']):,.0f}", "note": "Estimated accrual"},
+                {"label": "Credit/Margin", "value": f"${credit_income_total:,.0f}", "note": "Interest income"},
+            ],
+        },
+    ]
+    render_kpi_sections(kpi_sections)
 
-    st.markdown("### Contribution to return — price breakdown by ticker")
-    px_breakdown = build_price_breakdown_table(snap, valuation_date=analyze_date)
-    px_breakdown = build_price_breakdown_table(snap)
-    if px_breakdown.empty:
-        st.info("No price breakdown available yet (need holdings and/or closed trades).")
-    else:
-        show_px = px_breakdown.copy()
-        for col in ["avg_buy_price", "avg_sold_price", "current_price"]:
-            show_px[col] = pd.to_numeric(show_px[col], errors="coerce")
-            show_px[col] = show_px[col].map(lambda x: f"${x:,.4f}" if pd.notna(x) else "N/A")
-        st.dataframe(show_px, use_container_width=True)
+    section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Positions"])
 
-    st.markdown("### Dividend tracker (estimated)")
-    if divpack["quarterly"] is None or divpack["quarterly"].empty:
-        st.info("No dividend events found for held LONG tickers in this period.")
-    else:
-        st.dataframe(divpack["quarterly"], use_container_width=True)
-        st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
+    with section_tabs[0]:
+        st.markdown("### NAV / performance")
+        if nav_series is None or nav_series.dropna().empty:
+            st.info("No NAV series yet for performance.")
+        else:
+            perf_nav = nav_series.dropna().sort_index().to_frame(name="NAV")
+            st.line_chart(perf_nav)
+        cperf1, cperf2 = st.columns(2)
+        with cperf1:
+            st.markdown("### Drawdown")
+            if nav_series is None or nav_series.dropna().empty:
+                st.info("No NAV series yet for drawdown.")
+            else:
+                dd = compute_drawdown(nav_series)
+                st.line_chart(dd)
+        with cperf2:
+            st.markdown("### Rolling / monthly returns")
+            if nav_series is None or nav_series.dropna().empty:
+                st.info("No return series available.")
+            else:
+                ret = nav_series.pct_change().dropna()
+                st.bar_chart(ret.tail(24))
 
-    st.markdown("### Drawdown")
-    if nav_series is None or nav_series.dropna().empty:
-        st.info("No NAV series yet for drawdown.")
-    else:
-        dd = compute_drawdown(nav_series)
-        st.line_chart(dd)
+    with section_tabs[1]:
+        sector_alloc, industry_alloc = build_allocation_tables(snap)
+        a1, a2 = st.columns([1, 1])
+        with a1:
+            st.markdown("### Sector allocation (ABS exposure incl. cash)")
+            render_sector_pie(sector_alloc, f"{pname} — Sector Exposure (Abs)")
+            st.dataframe(
+                sector_alloc.assign(weight_pct=(sector_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
+                use_container_width=True,
+            )
+        with a2:
+            st.markdown("### Sector → Industry breakdown (ABS exposure)")
+            st.dataframe(
+                industry_alloc.assign(weight_pct=(industry_alloc["weight"] * 100).round(2)).drop(columns=["weight"]),
+                use_container_width=True,
+            )
 
-    st.markdown("### Beta / Alpha vs SPY")
-    if nav_series is None or spy_px is None or nav_series.dropna().empty or spy_px.dropna().empty:
-        st.info("Beta/alpha need both portfolio NAV series and benchmark series.")
-    else:
-        stats = compute_beta_alpha(nav_series, spy_px)
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Beta", f"{stats['beta']:.2f}" if np.isfinite(stats["beta"]) else "—")
-        k2.metric("Alpha (annualized)", f"{stats['alpha_ann']*100:.2f}%" if np.isfinite(stats["alpha_ann"]) else "—")
-        k3.metric("R²", f"{stats['r2']:.2f}" if np.isfinite(stats["r2"]) else "—")
-        k4.metric("Obs", f"{stats['n']}")
+        st.markdown("### Contribution to return (P&L contribution by ticker)")
+        contrib = build_contribution_table(snap)
+        if contrib.empty:
+            st.info("No contribution data yet (need holdings and/or sells/covers/dividends).")
+        else:
+            show_contrib = contrib.copy()
+            for col in ["unrealized_return_pct", "realized_return_pct"]:
+                show_contrib[col] = pd.to_numeric(show_contrib[col], errors="coerce")
+                show_contrib[col] = show_contrib[col].map(lambda x: f"{x:,.2f}%" if pd.notna(x) else "N/A")
+            st.dataframe(show_contrib, use_container_width=True)
+            chart_df = contrib.set_index("ticker")[["total_contribution"]]
+            st.bar_chart(chart_df)
 
-        roll = rolling_beta_alpha(nav_series, spy_px, window=26)
-        if not roll.empty:
-            r1, r2 = st.columns(2)
-            with r1:
-                st.caption("Rolling beta (26 periods)")
-                st.line_chart(roll[["beta"]])
-            with r2:
-                st.caption("Rolling alpha (annualized, 26 periods)")
-                st.line_chart(roll[["alpha_ann"]])
+        st.markdown("### Contribution to return — price breakdown by ticker")
+        px_breakdown = build_price_breakdown_table(snap, valuation_date=analyze_date)
+        if px_breakdown.empty:
+            st.info("No price breakdown available yet (need holdings and/or closed trades).")
+        else:
+            show_px = px_breakdown.copy()
+            for col in ["avg_buy_price", "avg_sold_price", "current_price"]:
+                show_px[col] = pd.to_numeric(show_px[col], errors="coerce")
+                show_px[col] = show_px[col].map(lambda x: f"${x:,.4f}" if pd.notna(x) else "N/A")
+            st.dataframe(show_px, use_container_width=True)
 
-    st.divider()
-    if not snap["holdings"].empty:
-        st.markdown("### Holdings (net shares can be negative for shorts)")
-        st.dataframe(snap["holdings"], use_container_width=True)
+    with section_tabs[2]:
+        st.markdown("### Monthly credit income")
+        if credit_income_report.empty:
+            st.info("No monthly credit interest income posted yet.")
+        else:
+            show_credit = credit_income_report.copy()
+            show_credit["month"] = pd.to_datetime(show_credit["month"]).dt.strftime("%Y-%m")
+            st.dataframe(show_credit, use_container_width=True)
+            chart_credit = credit_income_report.copy()
+            chart_credit["month"] = pd.to_datetime(chart_credit["month"])
+            st.bar_chart(chart_credit.set_index("month")[["total_credit_income"]].sort_index())
 
-    if not snap["lots"].empty:
-        st.markdown("### Open lots (baseline + trades) — LONG & SHORT")
-        st.dataframe(snap["lots"].sort_values(["ticker", "buy_date"]), use_container_width=True)
+        st.markdown("### Dividend tracker (estimated)")
+        if divpack["quarterly"] is None or divpack["quarterly"].empty:
+            st.info("No dividend events found for held LONG tickers in this period.")
+        else:
+            st.dataframe(divpack["quarterly"], use_container_width=True)
+            st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
 
-    if not snap["realized"].empty:
-        rv = snap["realized"].copy()
-        rv["realized_return_%"] = np.where(
-            rv["buy_price"] > 0,
-            ((rv["sell_price"] / rv["buy_price"]) - 1.0) * 100.0,
-            np.nan,
-        )
-        st.markdown("### Realized matches (per lot) — sells & covers")
-        st.dataframe(rv.sort_values(["sell_date", "ticker"], ascending=False), use_container_width=True)
+    with section_tabs[3]:
+        st.markdown("### Beta / Alpha vs SPY")
+        if nav_series is None or spy_px is None or nav_series.dropna().empty or spy_px.dropna().empty:
+            st.info("Beta/alpha need both portfolio NAV series and benchmark series.")
+        else:
+            stats = compute_beta_alpha(nav_series, spy_px)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Beta", f"{stats['beta']:.2f}" if np.isfinite(stats["beta"]) else "—")
+            k2.metric("Alpha (annualized)", f"{stats['alpha_ann']*100:.2f}%" if np.isfinite(stats["alpha_ann"]) else "—")
+            k3.metric("R²", f"{stats['r2']:.2f}" if np.isfinite(stats["r2"]) else "—")
+            k4.metric("Obs", f"{stats['n']}")
 
-    st.markdown("### Transactions (filtered by boundary when snapshot)")
-    if snap["filtered_txns"].empty:
-        st.write("No transactions.")
-    else:
-        st.dataframe(snap["filtered_txns"], use_container_width=True)
+            roll = rolling_beta_alpha(nav_series, spy_px, window=26)
+            if not roll.empty:
+                r1, r2 = st.columns(2)
+                with r1:
+                    st.caption("Rolling beta (26 periods)")
+                    st.line_chart(roll[["beta"]])
+                with r2:
+                    st.caption("Rolling alpha (annualized, 26 periods)")
+                    st.line_chart(roll[["alpha_ann"]])
+
+    with section_tabs[4]:
+        if not snap["holdings"].empty:
+            st.markdown("### Holdings (searchable, sortable)")
+            h = snap["holdings"].copy()
+            rename_map = {
+                "ticker": "ticker",
+                "net_shares": "shares",
+                "avg_cost": "cost basis",
+                "last_price": "price",
+                "market_value": "market value",
+                "unrealized_pnl": "unrealized P/L",
+                "realized_pnl": "realized P/L",
+                "dividend_yield": "dividend yield",
+                "sector_bucket": "sector",
+            }
+            h = h.rename(columns={k: v for k, v in rename_map.items() if k in h.columns})
+            query = st.text_input("Search ticker or name", key=f"holding_query_{pname}")
+            quick = st.selectbox("Quick filter", ["All", "Winners", "Losers", "Largest Positions", "Highest Yield"], key=f"quick_hold_{pname}")
+            if query:
+                qq = query.lower()
+                mask = h.get("ticker", pd.Series("", index=h.index)).astype(str).str.lower().str.contains(qq)
+                if "name" in h.columns:
+                    mask = mask | h["name"].astype(str).str.lower().str.contains(qq)
+                h = h[mask]
+            if quick == "Winners" and "unrealized P/L" in h.columns:
+                h = h[h["unrealized P/L"] > 0]
+            elif quick == "Losers" and "unrealized P/L" in h.columns:
+                h = h[h["unrealized P/L"] < 0]
+            elif quick == "Largest Positions" and "market value" in h.columns:
+                h = h.sort_values("market value", ascending=False).head(15)
+            elif quick == "Highest Yield" and "dividend yield" in h.columns:
+                h = h.sort_values("dividend yield", ascending=False).head(15)
+            if "last updated" not in h.columns:
+                h["last updated"] = pd.to_datetime(analyze_date).date().isoformat()
+            st.dataframe(h, use_container_width=True)
+
+        if not snap["lots"].empty:
+            st.markdown("### Open lots (baseline + trades) — LONG & SHORT")
+            st.dataframe(snap["lots"].sort_values(["ticker", "buy_date"]), use_container_width=True)
+
+        if not snap["realized"].empty:
+            rv = snap["realized"].copy()
+            rv["realized_return_%"] = np.where(
+                rv["buy_price"] > 0,
+                ((rv["sell_price"] / rv["buy_price"]) - 1.0) * 100.0,
+                np.nan,
+            )
+            st.markdown("### Realized matches (per lot) — sells & covers")
+            st.dataframe(rv.sort_values(["sell_date", "ticker"], ascending=False), use_container_width=True)
+
+        st.markdown("### Transactions (filtered by boundary when snapshot)")
+        if snap["filtered_txns"].empty:
+            st.write("No transactions.")
+        else:
+            st.dataframe(snap["filtered_txns"], use_container_width=True)
 
 
 # ----------------------------
@@ -1677,15 +2281,18 @@ if is_admin:
     st.markdown("---")
     st.header("Admin")
 
-    # =========================
-    # Create portfolio (TOP)
-    # =========================
     st.subheader("Create portfolio")
     with st.form("create_portfolio_form", clear_on_submit=True):
         new_name = st.text_input("Name", placeholder="e.g., Long Only, Trading, IRA")
         new_mode = st.selectbox("Start mode", VALID_MODES, index=0)
         new_asof = st.date_input("As-of date", value=date.today(), min_value=PORTFOLIO_MIN_DATE)
         new_cash = st.number_input("Starting cash ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
+        new_credit_spread = st.number_input(
+            "IRX haircut / spread (% annual)",
+            value=DEFAULT_CREDIT_SPREAD_PCT,
+            step=0.05,
+            format="%.2f",
+        )
         submitted = st.form_submit_button("Add portfolio")
 
     if submitted:
@@ -1705,6 +2312,7 @@ if is_admin:
                                 "start_mode": new_mode,
                                 "as_of_date": pd.to_datetime(new_asof),
                                 "starting_cash": float(new_cash),
+                                "credit_spread_pct": float(new_credit_spread),
                             }
                         ]
                     ),
@@ -1717,20 +2325,11 @@ if is_admin:
 
     st.divider()
 
-    # =========================
-    # Active portfolio selector
-    # =========================
     active = st.selectbox("Active portfolio", portfolio_names, index=0, key="admin_active_portfolio")
     meta = get_portfolio_meta(portfolios_df, active)
 
-    # =========================
-    # Tabs
-    # =========================
     admin_tabs = st.tabs(["Transactions", "Portfolio Settings", "Baseline lots", "Documentation"])
 
-    # -----------------------
-    # Transactions tab
-    # -----------------------
     with admin_tabs[0]:
         st.subheader("Transactions")
 
@@ -1751,11 +2350,8 @@ if is_admin:
         refresh_pressed = False
         add_txn = False
 
-        # -----------------------
-        # Add transaction (manual)
-        # -----------------------
         with st.form("add_txn_form", clear_on_submit=False):
-            txn_type = st.selectbox("Type", ["buy", "sell", "short", "cover", "dividend"], index=0)
+            txn_type = st.selectbox("Type", ["buy", "sell", "short", "cover", "dividend", "credit_interest"], index=0)
             t_date = st.date_input("Date", value=date.today())
 
             if txn_type in ["buy", "sell", "short", "cover"]:
@@ -1786,7 +2382,9 @@ if is_admin:
                 rec = fetch_close_on_or_before(tkr_clean, chosen_date) if tkr_clean else None
 
                 if price_key not in st.session_state:
-                    st.session_state[price_key] = float(rec) if (st.session_state[use_rec_key] and rec is not None) else 100.00
+                    st.session_state[price_key] = (
+                        float(rec) if (st.session_state[use_rec_key] and rec is not None) else 100.00
+                    )
 
                 if st.session_state[use_rec_key] and rec is not None:
                     st.session_state[price_key] = float(rec)
@@ -1807,13 +2405,17 @@ if is_admin:
                     st.caption(f"Recommended close for {tkr_clean} on/before {chosen_date.isoformat()}: **${rec:,.4f}**")
 
             else:
+                st.caption(
+                    "Non-trade cash income rows supported: "
+                    "**dividend** and **credit_interest**. "
+                    "Auto monthly credit_interest is generated using beginning-of-month cash and latest ^IRX less your configured haircut."
+                )
                 c1, c2 = st.columns([1, 1])
                 with c1:
                     t_ticker = st.text_input("Ticker (optional)", value="")
                 with c2:
-                    t_amount = st.number_input(
-                        "Dividend amount ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f"
-                    )
+                    label = "Cash income amount ($)" if txn_type == "credit_interest" else "Dividend amount ($)"
+                    t_amount = st.number_input(label, min_value=0.0, value=0.0, step=1.0, format="%.2f")
 
             add_txn = st.form_submit_button("Save transaction")
 
@@ -1869,9 +2471,6 @@ if is_admin:
                 st.success("Saved.")
                 st.rerun()
 
-        # -----------------------
-        # Bulk upload (beneath Add transaction)
-        # -----------------------
         st.divider()
         st.subheader("Bulk upload (CSV)")
 
@@ -1916,7 +2515,6 @@ Notes:
             size = getattr(f, "size", "unknown")
             return f"{name}::{size}"
 
-        # IMPORTANT: only re-parse + clear previews when the file changes
         if up is not None:
             sig = _file_signature(up)
             prev_sig = st.session_state.get(file_sig_key)
@@ -1999,9 +2597,113 @@ Notes:
         elif up is not None and isinstance(raw_import, pd.DataFrame) and raw_import.empty:
             st.info("No valid buy/sell/short/cover rows found in this file (or required columns missing).")
 
-        # -----------------------
-        # Delete transaction
-        # -----------------------
+        st.divider()
+        st.subheader("Monthly credit_interest upload (CSV)")
+        credit_up = st.file_uploader(
+            "Upload monthly credit_interest CSV",
+            type=["csv"],
+            key=f"credit_upload_csv__{active}",
+            help="""
+Required CSV headers (exact):
+
+MONTH | AMOUNT
+
+Optional:
+TICKER
+
+Examples:
+• MONTH: 2024-01
+• AMOUNT: 125.50
+• TICKER (optional): CASH
+
+Notes:
+• This uploader is only for monthly credit_interest rows.
+• MONTH is saved as the first day of the month.
+• Import can Append or Replace existing credit_interest rows for this portfolio.
+""",
+        )
+
+        credit_mode = st.radio(
+            "Credit interest import mode",
+            ["Append", "Replace credit_interest"],
+            horizontal=True,
+            key=f"credit_mode__{active}",
+        )
+
+        credit_good_key = f"credit_good__{active}"
+        credit_bad_key = f"credit_bad__{active}"
+        credit_file_sig_key = f"credit_file_sig__{active}"
+
+        if credit_up is not None:
+            credit_sig = _file_signature(credit_up)
+            prev_credit_sig = st.session_state.get(credit_file_sig_key)
+            if credit_sig != prev_credit_sig:
+                st.session_state[credit_file_sig_key] = credit_sig
+                try:
+                    credit_good, credit_bad = parse_credit_interest_csv(credit_up)
+                    st.session_state[credit_good_key] = credit_good
+                    st.session_state[credit_bad_key] = credit_bad
+                except Exception as e:
+                    st.error(f"Credit-interest upload failed: {e}")
+                    st.session_state[credit_good_key] = pd.DataFrame()
+                    st.session_state[credit_bad_key] = pd.DataFrame()
+
+        credit_good = st.session_state.get(credit_good_key, pd.DataFrame())
+        credit_bad = st.session_state.get(credit_bad_key, pd.DataFrame())
+
+        if isinstance(credit_bad, pd.DataFrame) and not credit_bad.empty:
+            st.warning(f"Skipped credit_interest rows: {len(credit_bad)}")
+            st.dataframe(credit_bad, use_container_width=True)
+
+        if isinstance(credit_good, pd.DataFrame) and not credit_good.empty:
+            st.success(f"Ready to import credit_interest rows: {len(credit_good)}")
+
+            credit_preview = credit_good.copy()
+            credit_preview["date"] = pd.to_datetime(credit_preview["date"]).dt.date.astype(str)
+            st.dataframe(credit_preview, use_container_width=True)
+
+            if st.button("✅ Import monthly credit_interest", type="primary", key=f"credit_import_btn__{active}"):
+                rows = []
+                base_id = pd.Timestamp.utcnow().value
+                for i, r in credit_good.reset_index(drop=True).iterrows():
+                    rows.append(
+                        {
+                            "txn_id": str(base_id + i),
+                            "portfolio": active,
+                            "date": pd.to_datetime(r["date"]),
+                            "type": "credit_interest",
+                            "ticker": str(r.get("ticker", "")).upper().strip(),
+                            "shares": np.nan,
+                            "price": np.nan,
+                            "amount": float(r["amount"]),
+                        }
+                    )
+
+                credit_import_df = pd.DataFrame(rows)
+                if credit_mode == "Replace credit_interest":
+                    keep = txns_all[~((txns_all["portfolio"] == active) & (txns_all["type"] == "credit_interest"))].copy()
+                    candidate_txns = pd.concat([keep, credit_import_df], ignore_index=True)
+                else:
+                    candidate_txns = pd.concat([txns_all, credit_import_df], ignore_index=True)
+
+                p_txns2 = candidate_txns[candidate_txns["portfolio"] == active].copy()
+                p_base2 = baseline_all[baseline_all["portfolio"] == active].copy()
+
+                ok, msg = validate_candidate_state(meta, p_txns2, p_base2, match_method)
+                if not ok:
+                    st.error(f"Credit-interest import rejected: {msg}")
+                else:
+                    txns_all = candidate_txns
+                    save_txns(txns_all)
+                    st.success(
+                        f"Imported {len(credit_import_df)} credit_interest rows into '{active}' ({credit_mode})."
+                    )
+                    st.session_state.pop(credit_good_key, None)
+                    st.session_state.pop(credit_bad_key, None)
+                    st.rerun()
+        elif credit_up is not None:
+            st.info("No valid monthly credit_interest rows found in this file.")
+
         st.divider()
         st.subheader("Delete transaction")
 
@@ -2013,23 +2715,29 @@ Notes:
             disp["date_str"] = pd.to_datetime(disp["date"]).dt.date.astype(str)
 
             trade_mask = disp["type"].isin(["buy", "sell", "short", "cover"])
+
+            trade_rows = disp.loc[trade_mask]
             disp.loc[trade_mask, "desc"] = (
-                disp.loc[trade_mask, "date_str"]
+                trade_rows["date_str"].astype(str)
                 + " | "
-                + disp.loc[trade_mask, "type"]
+                + trade_rows["type"].astype(str)
                 + " | "
-                + disp.loc[trade_mask, "ticker"]
+                + trade_rows["ticker"].fillna("").astype(str)
                 + " | "
-                + disp.loc[trade_mask, "shares"].map(lambda x: f"{x:.3f}")
+                + pd.to_numeric(trade_rows["shares"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.3f}")
                 + " @ "
-                + disp.loc[trade_mask, "price"].map(lambda x: f"{x:.2f}")
+                + pd.to_numeric(trade_rows["price"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}")
             )
+
+            cash_rows = disp.loc[~trade_mask]
             disp.loc[~trade_mask, "desc"] = (
-                disp.loc[~trade_mask, "date_str"]
-                + " | dividend | "
-                + disp.loc[~trade_mask, "ticker"].fillna("").astype(str)
+                cash_rows["date_str"].astype(str)
+                + " | "
+                + cash_rows["type"].astype(str)
+                + " | "
+                + cash_rows["ticker"].fillna("").astype(str)
                 + " | $"
-                + disp.loc[~trade_mask, "amount"].map(lambda x: f"{x:.2f}")
+                + pd.to_numeric(cash_rows["amount"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}")
             )
 
             disp["display"] = disp["desc"] + " | id=" + disp["txn_id"].astype(str)
@@ -2052,9 +2760,6 @@ Notes:
                     st.warning("Deleted.")
                     st.rerun()
 
-    # -----------------------
-    # Portfolio Settings tab
-    # -----------------------
     with admin_tabs[1]:
         st.subheader(f"Portfolio settings: {active}")
 
@@ -2068,19 +2773,23 @@ Notes:
                 step=100.0,
                 format="%.2f",
             )
+            spread_u = st.number_input(
+                "IRX haircut / spread (% annual)",
+                value=float(meta.get("credit_spread_pct", DEFAULT_CREDIT_SPREAD_PCT)),
+                step=0.05,
+                format="%.2f",
+            )
             saved = st.form_submit_button("Save settings")
 
         if saved:
             portfolios_df.loc[portfolios_df["portfolio"] == active, "start_mode"] = mode_u
             portfolios_df.loc[portfolios_df["portfolio"] == active, "as_of_date"] = pd.to_datetime(asof_u)
             portfolios_df.loc[portfolios_df["portfolio"] == active, "starting_cash"] = float(cash_u)
+            portfolios_df.loc[portfolios_df["portfolio"] == active, "credit_spread_pct"] = float(spread_u)
             save_portfolios(portfolios_df)
             st.success("Saved.")
             st.rerun()
 
-    # -----------------------
-    # Baseline lots tab
-    # -----------------------
     with admin_tabs[2]:
         st.subheader("Baseline lots (snapshot portfolios only)")
 
@@ -2152,9 +2861,6 @@ Notes:
                     st.warning("Deleted baseline lot.")
                     st.rerun()
 
-    # -----------------------
-    # Documentation tab
-    # -----------------------
     with admin_tabs[3]:
         st.subheader("Documentation")
         st.markdown(
@@ -2164,7 +2870,7 @@ Notes:
 **If you have full history (ledger-complete):**
 1. Go to **Portfolio Settings** → set **Start mode** = `ledger_complete`
 2. Set **Starting cash** (cash at the beginning of your ledger)
-3. Enter **all trades/dividends** in **Transactions**
+3. Enter **all trades/dividends/manual credit_interest** in **Transactions**
 
 **If you only have today's holdings (snapshot-start):**
 1. Go to **Portfolio Settings** → set **Start mode** = `snapshot_start`
@@ -2185,6 +2891,15 @@ Notes:
 - **cover** is only for reducing SHORT shares.
 - This app enforces **no negative cash** (no margin loans). If a transaction would make cash go negative, it is rejected.
 
+### Credit interest
+
+- `credit_interest` is supported as a real cash-income transaction type.
+- The app also auto-generates monthly `credit_interest` for completed months using:
+  - beginning-of-month cash
+  - latest **^IRX** as a proxy for cash yield
+  - minus a configurable annual haircut/spread (default **0.50%**) set in Portfolio Settings
+- If a manual `credit_interest` transaction already exists in a month, auto-accrual is skipped for that month.
+
 **Dividends:** estimated dividend accrual is calculated on LONG shares only (does not model borrow costs / dividends-in-lieu on shorts).
 
 ### Bulk upload CSV
@@ -2197,12 +2912,22 @@ Required headers:
 
 Optional:
 - PRICE  (if blank/missing, we fetch Yahoo close on/before DATE)
+
+### Monthly credit interest CSV upload
+
+Use the dedicated uploader in **Transactions** for manual monthly credit interest.
+
+Required headers:
+- MONTH (e.g. `2024-01`)
+- AMOUNT
+
+Optional:
+- TICKER
+
+This creates `credit_interest` transactions dated on the first day of each month.
 """
         )
 
-    # =========================
-    # Backup download
-    # =========================
     st.divider()
     st.subheader("Backup")
     st.caption("Download a ZIP containing: portfolios.csv, transactions.csv, baseline_lots.csv")
