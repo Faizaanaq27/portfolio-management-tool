@@ -1,5 +1,6 @@
 # app.py
 import hmac
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -1710,18 +1711,36 @@ def compute_dividend_accrual_quarterly(
             .sort_values("quarter_end")
             .reset_index(drop=True)
         )
-        return {"total": float(ev_manual["div_cash"].sum()), "events": ev_manual, "quarterly": q_manual}
+        return {
+            "total": float(ev_manual["div_cash"].sum()),
+            "events": ev_manual,
+            "quarterly": q_manual,
+            "diagnostics": {"used_manual": True, "long_tickers_checked": [], "no_dividend_data_tickers": []},
+        }
 
     shares_df = compute_daily_shares_df(pname, meta, txns_all, baseline_all, end)
     if shares_df.empty or shares_df.shape[1] == 0:
-        return {"total": 0.0, "events": pd.DataFrame(), "quarterly": pd.DataFrame()}
+        return {
+            "total": 0.0,
+            "events": pd.DataFrame(),
+            "quarterly": pd.DataFrame(),
+            "diagnostics": {"used_manual": False, "long_tickers_checked": [], "no_dividend_data_tickers": []},
+        }
 
     tickers = list(shares_df.columns)
     events = []
+    long_tickers_checked = []
+    no_dividend_data_tickers = []
 
     for t in tickers:
+        max_long = float(np.nanmax(pd.to_numeric(shares_df[t], errors="coerce").fillna(0.0).values)) if t in shares_df.columns else 0.0
+        if max_long <= 1e-12:
+            continue
+        long_tickers_checked.append(t)
+
         div = fetch_dividends_series(t, start, end)
         if div is None or div.empty:
+            no_dividend_data_tickers.append(t)
             continue
 
         for d, v in div.items():
@@ -1746,7 +1765,16 @@ def compute_dividend_accrual_quarterly(
             )
 
     if not events:
-        return {"total": 0.0, "events": pd.DataFrame(), "quarterly": pd.DataFrame()}
+        return {
+            "total": 0.0,
+            "events": pd.DataFrame(),
+            "quarterly": pd.DataFrame(),
+            "diagnostics": {
+                "used_manual": False,
+                "long_tickers_checked": sorted(long_tickers_checked),
+                "no_dividend_data_tickers": sorted(no_dividend_data_tickers),
+            },
+        }
 
     ev = pd.DataFrame(events).sort_values(["div_date", "ticker"]).reset_index(drop=True)
     q = (
@@ -1756,7 +1784,16 @@ def compute_dividend_accrual_quarterly(
         .reset_index(drop=True)
     )
     total = float(ev["div_cash"].sum())
-    return {"total": total, "events": ev, "quarterly": q}
+    return {
+        "total": total,
+        "events": ev,
+        "quarterly": q,
+        "diagnostics": {
+            "used_manual": False,
+            "long_tickers_checked": sorted(long_tickers_checked),
+            "no_dividend_data_tickers": sorted(no_dividend_data_tickers),
+        },
+    }
 
 
 # =========================
@@ -2185,6 +2222,15 @@ def render_public_portfolio(
                 "No dividend events were matched for held LONG tickers in this analysis window. "
                 "If holdings were short-only, cash-only, or very recent, this can be expected."
             )
+            diag = divpack.get("diagnostics", {})
+            checked = diag.get("long_tickers_checked", []) if isinstance(diag, dict) else []
+            no_data = diag.get("no_dividend_data_tickers", []) if isinstance(diag, dict) else []
+            if checked and len(no_data) == len(checked):
+                st.warning(
+                    "Market dividend data was empty for all held LONG tickers in this window: "
+                    + ", ".join(no_data)
+                    + ". This usually means the upstream Yahoo endpoint returned no actions data."
+                )
         else:
             st.dataframe(divpack["quarterly"], use_container_width=True)
             st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
