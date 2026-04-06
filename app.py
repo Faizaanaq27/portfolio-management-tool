@@ -2717,27 +2717,46 @@ Notes:
             trade_mask = disp["type"].isin(["buy", "sell", "short", "cover"])
 
             trade_rows = disp.loc[trade_mask]
+            trade_desc = pd.DataFrame(index=trade_rows.index)
+            trade_desc["date_str"] = trade_rows["date_str"].astype("string[python]").fillna("")
+            trade_desc["type"] = trade_rows["type"].astype("string[python]").fillna("")
+            trade_desc["ticker"] = trade_rows["ticker"].astype("string[python]").fillna("")
+            trade_desc["shares"] = (
+                pd.to_numeric(trade_rows["shares"], errors="coerce")
+                .fillna(0.0)
+                .map(lambda x: f"{x:.3f}")
+                .astype("string[python]")
+            )
+            trade_desc["price"] = (
+                pd.to_numeric(trade_rows["price"], errors="coerce")
+                .fillna(0.0)
+                .map(lambda x: f"{x:.2f}")
+                .astype("string[python]")
+            )
             disp.loc[trade_mask, "desc"] = (
-                trade_rows["date_str"].astype(str)
-                + " | "
-                + trade_rows["type"].astype(str)
-                + " | "
-                + trade_rows["ticker"].fillna("").astype(str)
-                + " | "
-                + pd.to_numeric(trade_rows["shares"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.3f}")
-                + " @ "
-                + pd.to_numeric(trade_rows["price"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}")
+                trade_desc["date_str"]
+                .str.cat(trade_desc["type"], sep=" | ")
+                .str.cat(trade_desc["ticker"], sep=" | ")
+                .str.cat(trade_desc["shares"], sep=" | ")
+                .str.cat(trade_desc["price"], sep=" @ ")
             )
 
             cash_rows = disp.loc[~trade_mask]
+            cash_desc = pd.DataFrame(index=cash_rows.index)
+            cash_desc["date_str"] = cash_rows["date_str"].astype("string[python]").fillna("")
+            cash_desc["type"] = cash_rows["type"].astype("string[python]").fillna("")
+            cash_desc["ticker"] = cash_rows["ticker"].astype("string[python]").fillna("")
+            cash_desc["amount"] = (
+                pd.to_numeric(cash_rows["amount"], errors="coerce")
+                .fillna(0.0)
+                .map(lambda x: f"${x:.2f}")
+                .astype("string[python]")
+            )
             disp.loc[~trade_mask, "desc"] = (
-                cash_rows["date_str"].astype(str)
-                + " | "
-                + cash_rows["type"].astype(str)
-                + " | "
-                + cash_rows["ticker"].fillna("").astype(str)
-                + " | $"
-                + pd.to_numeric(cash_rows["amount"], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}")
+                cash_desc["date_str"]
+                .str.cat(cash_desc["type"], sep=" | ")
+                .str.cat(cash_desc["ticker"], sep=" | ")
+                .str.cat(cash_desc["amount"], sep=" | ")
             )
 
             disp["display"] = disp["desc"] + " | id=" + disp["txn_id"].astype(str)
