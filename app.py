@@ -289,7 +289,7 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
     else:
         close = pd.Series({tickers[0]: data["Close"].iloc[-1]})
 
-    close.index = [str(x).upper() for x in close.index]
+    close.index = [str(x).upper().strip() for x in close.index]
     return close.astype(float)
 
 
@@ -327,18 +327,19 @@ def fetch_prices_on_or_before(tickers: list[str], d: date) -> pd.Series:
     today_n = pd.to_datetime(date.today()).normalize()
 
     if target >= today_n:
-        return fetch_last_prices(cleaned)
+        result = fetch_last_prices(cleaned)
+    else:
+        start = target - pd.Timedelta(days=14)
+        px = fetch_price_history(cleaned, start=start, end=target)
+        if px is None or px.empty:
+            return pd.Series(dtype=float)
+        px = px[px.index <= target]
+        if px.empty:
+            return pd.Series(dtype=float)
+        result = px.iloc[-1].astype(float)
 
-    start = target - pd.Timedelta(days=14)
-    px = fetch_price_history(cleaned, start=start, end=target)
-    if px is None or px.empty:
-        return pd.Series(dtype=float)
-
-    px = px[px.index <= target]
-    if px.empty:
-        return pd.Series(dtype=float)
-
-    return px.iloc[-1].astype(float)
+    result.index = [str(x).upper().strip() for x in result.index]
+    return result
 
 
 @st.cache_data(ttl=1800)
@@ -1483,6 +1484,25 @@ def build_price_breakdown_table(snap: dict, valuation_date: date | None = None) 
     eval_date = valuation_date if valuation_date is not None else date.today()
     live = fetch_prices_on_or_before(tickers, eval_date)
     out["current_price"] = out["ticker"].map(live)
+
+    # Fallback: if market data is unavailable for a ticker, use the latest recorded
+    # transaction price from the filtered trade ledger so we still show a usable value.
+    tx = snap.get("filtered_txns")
+    if tx is not None and not tx.empty:
+        tx_prices = tx[tx["type"].isin(["buy", "sell", "short", "cover"])][["ticker", "date", "price"]].copy()
+        tx_prices["ticker"] = tx_prices["ticker"].astype(str).str.upper().str.strip()
+        tx_prices["date"] = pd.to_datetime(tx_prices["date"], errors="coerce")
+        tx_prices["price"] = pd.to_numeric(tx_prices["price"], errors="coerce")
+        tx_prices = tx_prices.dropna(subset=["ticker", "date", "price"])
+        tx_prices = tx_prices[(tx_prices["ticker"] != "") & (tx_prices["price"] > 0)]
+        if not tx_prices.empty:
+            tx_prices = tx_prices.sort_values(["ticker", "date"])
+            latest_tx_px = tx_prices.groupby("ticker", as_index=False).tail(1).set_index("ticker")["price"]
+            out["current_price"] = out["current_price"].fillna(out["ticker"].map(latest_tx_px))
+
+    # Final fallback: if no live/transaction price exists, use available per-ticker
+    # averages so the table remains complete.
+    out["current_price"] = out["current_price"].fillna(out["avg_sold_price"]).fillna(out["avg_buy_price"])
 
     return out.sort_values("ticker").reset_index(drop=True)
 
