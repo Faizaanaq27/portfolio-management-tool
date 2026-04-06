@@ -279,9 +279,36 @@ def save_baseline(df: pd.DataFrame) -> None:
 # =========================
 # 2c) Market data helpers
 # =========================
+def _extract_close_frame(data: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    if isinstance(data.columns, pd.MultiIndex):
+        price_levels = [str(x) for x in data.columns.get_level_values(0)]
+        if "Close" in price_levels:
+            close = data["Close"].copy()
+        elif "Adj Close" in price_levels:
+            close = data["Adj Close"].copy()
+        else:
+            return pd.DataFrame()
+    else:
+        if "Close" in data.columns:
+            close = pd.DataFrame({tickers[0]: data["Close"]})
+        elif "Adj Close" in data.columns:
+            close = pd.DataFrame({tickers[0]: data["Adj Close"]})
+        else:
+            return pd.DataFrame()
+
+    close.index = pd.to_datetime(close.index, errors="coerce")
+    close = close[~close.index.isna()].sort_index()
+    close.columns = [str(c).upper() for c in close.columns]
+    return close
+
+
 @st.cache_data(ttl=600)
 def fetch_last_prices(tickers: list[str]) -> pd.Series:
-    if not tickers:
+    cleaned = sorted(set([str(x).upper().strip() for x in tickers if str(x).strip()]))
+    if not cleaned:
         return pd.Series(dtype=float)
 
     data = yf.download(tickers, period="5d", interval="1d", auto_adjust=True, progress=False)
@@ -303,8 +330,14 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
 
     close = close.iloc[-1]
 
-    close.index = [str(x).upper() for x in close.index]
-    return close.astype(float)
+    missing = [t for t in cleaned if t not in out.index or pd.isna(out.get(t))]
+    for t in missing:
+        px = fetch_close_on_or_before(t, date.today())
+        if px is not None and pd.notna(px):
+            out.loc[t] = float(px)
+
+    out.index = [str(x).upper() for x in out.index]
+    return out.astype(float)
 
 
 @st.cache_data(ttl=900)
@@ -321,13 +354,10 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
         progress=False,
     )
 
-    if isinstance(data.columns, pd.MultiIndex):
-        px = data["Close"].copy()
-    else:
-        px = pd.DataFrame({tickers[0]: data["Close"]})
-
+    px = _extract_close_frame(data, tickers)
+    if px.empty:
+        return px
     px.index = pd.to_datetime(px.index).normalize()
-    px.columns = [str(c).upper() for c in px.columns]
     px = px.sort_index().ffill()
     return px
 
@@ -367,13 +397,10 @@ def fetch_close_on_or_before(ticker: str, d: date) -> float | None:
 
     try:
         df = yf.download([t], start=start, end=end, interval="1d", auto_adjust=True, progress=False)
-        if df is None or df.empty:
+        close_df = _extract_close_frame(df, [t])
+        if close_df.empty:
             return None
-        close = df["Close"] if not isinstance(df.columns, pd.MultiIndex) else df["Close"]
-        if isinstance(close, pd.DataFrame):
-            s = close[t]
-        else:
-            s = close
+        s = close_df[t] if t in close_df.columns else close_df.iloc[:, 0]
         s.index = pd.to_datetime(s.index).normalize()
         s = s.dropna().sort_index()
         s = s[s.index <= target]
