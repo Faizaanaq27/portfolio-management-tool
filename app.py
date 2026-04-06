@@ -285,10 +285,23 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
         return pd.Series(dtype=float)
 
     data = yf.download(tickers, period="5d", interval="1d", auto_adjust=True, progress=False)
+
+    if data is None or data.empty:
+        return pd.Series(dtype=float)
+
     if isinstance(data.columns, pd.MultiIndex):
-        close = data["Close"].iloc[-1]
+        close = data["Close"].copy()
     else:
-        close = pd.Series({tickers[0]: data["Close"].iloc[-1]})
+        close = pd.DataFrame({tickers[0]: data["Close"]})
+
+    close.index = pd.to_datetime(close.index, errors="coerce")
+    close = close[~close.index.isna()].sort_index()
+    close = close.ffill()
+    close = close.dropna(axis=1, how="all")
+    if close.empty:
+        return pd.Series(dtype=float)
+
+    close = close.iloc[-1]
 
     close.index = [str(x).upper() for x in close.index]
     return close.astype(float)
