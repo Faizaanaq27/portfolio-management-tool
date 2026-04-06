@@ -311,11 +311,24 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
     if not cleaned:
         return pd.Series(dtype=float)
 
-    data = yf.download(cleaned, period="5d", interval="1d", auto_adjust=True, progress=False)
-    close = _extract_close_frame(data, cleaned)
+    data = yf.download(tickers, period="5d", interval="1d", auto_adjust=True, progress=False)
+
+    if data is None or data.empty:
+        return pd.Series(dtype=float)
+
+    if isinstance(data.columns, pd.MultiIndex):
+        close = data["Close"].copy()
+    else:
+        close = pd.DataFrame({tickers[0]: data["Close"]})
+
+    close.index = pd.to_datetime(close.index, errors="coerce")
+    close = close[~close.index.isna()].sort_index()
     close = close.ffill()
     close = close.dropna(axis=1, how="all")
-    out = close.iloc[-1].astype(float) if not close.empty else pd.Series(dtype=float)
+    if close.empty:
+        return pd.Series(dtype=float)
+
+    close = close.iloc[-1]
 
     missing = [t for t in cleaned if t not in out.index or pd.isna(out.get(t))]
     for t in missing:
