@@ -279,13 +279,6 @@ def save_baseline(df: pd.DataFrame) -> None:
 # =========================
 # 2c) Market data helpers
 # =========================
-def _safe_download(*args, **kwargs) -> pd.DataFrame:
-    try:
-        return yf.download(*args, **kwargs)
-    except Exception:
-        return pd.DataFrame()
-
-
 def _extract_close_frame(data: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     if data is None or data.empty:
         return pd.DataFrame()
@@ -318,11 +311,24 @@ def fetch_last_prices(tickers: list[str]) -> pd.Series:
     if not cleaned:
         return pd.Series(dtype=float)
 
-    data = _safe_download(cleaned, period="5d", interval="1d", auto_adjust=True, progress=False)
-    close = _extract_close_frame(data, cleaned)
+    data = yf.download(tickers, period="5d", interval="1d", auto_adjust=True, progress=False)
+
+    if data is None or data.empty:
+        return pd.Series(dtype=float)
+
+    if isinstance(data.columns, pd.MultiIndex):
+        close = data["Close"].copy()
+    else:
+        close = pd.DataFrame({tickers[0]: data["Close"]})
+
+    close.index = pd.to_datetime(close.index, errors="coerce")
+    close = close[~close.index.isna()].sort_index()
     close = close.ffill()
     close = close.dropna(axis=1, how="all")
-    out = close.iloc[-1].astype(float) if not close.empty else pd.Series(dtype=float)
+    if close.empty:
+        return pd.Series(dtype=float)
+
+    close = close.iloc[-1]
 
     missing = [t for t in cleaned if t not in out.index or pd.isna(out.get(t))]
     for t in missing:
@@ -347,30 +353,10 @@ def fetch_price_history(tickers: list[str], start: pd.Timestamp, end: pd.Timesta
         auto_adjust=True,
         progress=False,
     )
-    if data is None or (hasattr(data, "empty") and data.empty):
-        rows = {}
-        for t in sorted(set([str(x).upper().strip() for x in tickers if str(x).strip()])):
-            s = fetch_single_ticker_history(t, pd.to_datetime(start), pd.to_datetime(end))
-            if s is not None and not s.empty:
-                rows[t] = s
-        if not rows:
-            return pd.DataFrame()
-        px = pd.DataFrame(rows)
-        px.index = pd.to_datetime(px.index).normalize()
-        return px.sort_index().ffill()
 
     px = _extract_close_frame(data, tickers)
     if px.empty:
-        rows = {}
-        for t in sorted(set([str(x).upper().strip() for x in tickers if str(x).strip()])):
-            s = fetch_single_ticker_history(t, pd.to_datetime(start), pd.to_datetime(end))
-            if s is not None and not s.empty:
-                rows[t] = s
-        if not rows:
-            return pd.DataFrame()
-        px = pd.DataFrame(rows)
-        px.index = pd.to_datetime(px.index).normalize()
-        return px.sort_index().ffill()
+        return px
     px.index = pd.to_datetime(px.index).normalize()
     px = px.sort_index().ffill()
     return px
@@ -430,7 +416,7 @@ def fetch_close_on_or_before(ticker: str, d: date) -> float | None:
     end = (target + pd.Timedelta(days=1)).date()
 
     try:
-        df = _safe_download([t], start=start, end=end, interval="1d", auto_adjust=True, progress=False)
+        df = yf.download([t], start=start, end=end, interval="1d", auto_adjust=True, progress=False)
         close_df = _extract_close_frame(df, [t])
         if close_df.empty:
             return None
