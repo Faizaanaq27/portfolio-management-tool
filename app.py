@@ -1120,6 +1120,29 @@ def compute_nav_series_for_portfolio(
     end = pd.to_datetime(end_date).normalize()
 
     base_txns = txns_all[txns_all["portfolio"] == pname].copy()
+    if not base_txns.empty:
+        base_txns["date"] = pd.to_datetime(base_txns["date"], errors="coerce").dt.normalize()
+        base_txns = base_txns.dropna(subset=["date"]).copy()
+
+    # For ledger-complete portfolios, chart history should begin at the first available
+    # economic activity, not strictly the configured as-of date.
+    if str(meta.get("start_mode", "")).strip().lower() == "ledger_complete":
+        start_candidates: list[pd.Timestamp] = [start]
+        if not base_txns.empty:
+            start_candidates.append(base_txns["date"].min())
+
+        baseline_port = baseline_all[baseline_all["portfolio"] == pname].copy()
+        if not baseline_port.empty and "buy_date" in baseline_port.columns:
+            baseline_port["buy_date"] = pd.to_datetime(baseline_port["buy_date"], errors="coerce").dt.normalize()
+            baseline_port = baseline_port.dropna(subset=["buy_date"])
+            if not baseline_port.empty:
+                start_candidates.append(baseline_port["buy_date"].min())
+
+        start = min(start_candidates)
+
+    if start > end:
+        start = end
+
     txns = build_effective_txns(
         portfolio_meta=meta,
         portfolio_txns_all=base_txns,
