@@ -376,24 +376,83 @@ def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) 
     s = pd.to_datetime(start).normalize()
     e = pd.to_datetime(end).normalize()
 
-    div = yf.Ticker(t).dividends
-    if div is None or len(div) == 0:
+    if not t:
         return pd.Series(dtype=float, name=t)
 
-    idx = pd.to_datetime(div.index)
-    try:
-        if getattr(idx, "tz", None) is not None:
-            idx = idx.tz_convert(None)
-    except Exception:
-        try:
-            idx = idx.tz_localize(None)
-        except Exception:
-            pass
+    def _normalize_dividends(div_like: pd.Series | pd.DataFrame | None) -> pd.Series:
+        if div_like is None:
+            return pd.Series(dtype=float, name=t)
 
-    idx = pd.to_datetime(idx).normalize()
-    out = pd.Series(div.values, index=idx, name=t).sort_index()
-    out = out[(out.index >= s) & (out.index <= e)].copy()
-    return out.astype(float)
+        if isinstance(div_like, pd.DataFrame):
+            if "Dividends" in div_like.columns:
+                div_s = div_like["Dividends"]
+            elif div_like.shape[1] == 1:
+                div_s = div_like.iloc[:, 0]
+            else:
+                return pd.Series(dtype=float, name=t)
+        else:
+            div_s = div_like
+
+        if div_s is None or len(div_s) == 0:
+            return pd.Series(dtype=float, name=t)
+
+        idx = pd.to_datetime(div_s.index)
+        try:
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_convert(None)
+        except Exception:
+            try:
+                idx = idx.tz_localize(None)
+            except Exception:
+                pass
+
+        idx = pd.to_datetime(idx).normalize()
+        out = pd.Series(pd.to_numeric(div_s.values, errors="coerce"), index=idx, name=t)
+        out = out.dropna().groupby(level=0).sum().sort_index()
+        out = out[(out.index >= s) & (out.index <= e)].copy()
+        out = out[out > 0]
+        return out.astype(float)
+
+    # Yahoo endpoints can intermittently return an empty `.dividends` series.
+    # Try a few sources in priority order and use the first non-empty result.
+    providers: list[pd.Series] = []
+
+    try:
+        providers.append(_normalize_dividends(yf.Ticker(t).dividends))
+    except Exception:
+        pass
+
+    try:
+        hist_actions = yf.Ticker(t).history(period="max", auto_adjust=False, actions=True)
+        providers.append(_normalize_dividends(hist_actions))
+    except Exception:
+        pass
+
+    try:
+        dl = yf.download(
+            [t],
+            start=s.date(),
+            end=(e + pd.Timedelta(days=1)).date(),
+            interval="1d",
+            auto_adjust=False,
+            actions=True,
+            progress=False,
+        )
+        if isinstance(dl.columns, pd.MultiIndex):
+            if ("Dividends", t) in dl.columns:
+                providers.append(_normalize_dividends(dl[("Dividends", t)]))
+            elif "Dividends" in dl.columns.get_level_values(0):
+                providers.append(_normalize_dividends(dl["Dividends"]))
+        else:
+            providers.append(_normalize_dividends(dl.get("Dividends")))
+    except Exception:
+        pass
+
+    for candidate in providers:
+        if candidate is not None and not candidate.empty:
+            return candidate
+
+    return pd.Series(dtype=float, name=t)
 
 
 @st.cache_data(ttl=3600)
