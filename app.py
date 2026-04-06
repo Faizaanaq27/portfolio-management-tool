@@ -1,5 +1,6 @@
 # app.py
 import hmac
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -376,24 +377,87 @@ def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) 
     s = pd.to_datetime(start).normalize()
     e = pd.to_datetime(end).normalize()
 
-    div = yf.Ticker(t).dividends
-    if div is None or len(div) == 0:
+    if not t:
         return pd.Series(dtype=float, name=t)
 
-    idx = pd.to_datetime(div.index)
-    try:
-        if getattr(idx, "tz", None) is not None:
-            idx = idx.tz_convert(None)
-    except Exception:
-        try:
-            idx = idx.tz_localize(None)
-        except Exception:
-            pass
+    def _normalize_dividends(div_like: pd.Series | pd.DataFrame | None) -> pd.Series:
+        if div_like is None:
+            return pd.Series(dtype=float, name=t)
 
-    idx = pd.to_datetime(idx).normalize()
-    out = pd.Series(div.values, index=idx, name=t).sort_index()
-    out = out[(out.index >= s) & (out.index <= e)].copy()
-    return out.astype(float)
+        if isinstance(div_like, pd.DataFrame):
+            if "Dividends" in div_like.columns:
+                div_s = div_like["Dividends"]
+            elif div_like.shape[1] == 1:
+                div_s = div_like.iloc[:, 0]
+            else:
+                return pd.Series(dtype=float, name=t)
+        else:
+            div_s = div_like
+
+        if div_s is None or len(div_s) == 0:
+            return pd.Series(dtype=float, name=t)
+
+        idx = pd.to_datetime(div_s.index)
+        try:
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_convert(None)
+        except Exception:
+            try:
+                idx = idx.tz_localize(None)
+            except Exception:
+                pass
+
+        idx = pd.to_datetime(idx).normalize()
+        out = pd.Series(pd.to_numeric(div_s.values, errors="coerce"), index=idx, name=t)
+        out = out.dropna().groupby(level=0).sum().sort_index()
+        out = out[(out.index >= s) & (out.index <= e)].copy()
+        out = out[out > 0]
+        return out.astype(float)
+
+    # Yahoo endpoints can intermittently return an empty `.dividends` series.
+    # Try a few sources in priority order and use the first non-empty result.
+    providers: list[pd.Series] = []
+    errors: list[str] = []
+
+    try:
+        providers.append(_normalize_dividends(yf.Ticker(t).dividends))
+    except Exception as ex:
+        errors.append(f"Ticker.dividends: {type(ex).__name__}: {ex}")
+
+    try:
+        hist_actions = yf.Ticker(t).history(period="max", auto_adjust=False, actions=True)
+        providers.append(_normalize_dividends(hist_actions))
+    except Exception as ex:
+        errors.append(f"Ticker.history(actions=True): {type(ex).__name__}: {ex}")
+
+    try:
+        dl = yf.download(
+            [t],
+            start=s.date(),
+            end=(e + pd.Timedelta(days=1)).date(),
+            interval="1d",
+            auto_adjust=False,
+            actions=True,
+            progress=False,
+        )
+        if isinstance(dl.columns, pd.MultiIndex):
+            if ("Dividends", t) in dl.columns:
+                providers.append(_normalize_dividends(dl[("Dividends", t)]))
+            elif "Dividends" in dl.columns.get_level_values(0):
+                providers.append(_normalize_dividends(dl["Dividends"]))
+        else:
+            providers.append(_normalize_dividends(dl.get("Dividends")))
+    except Exception as ex:
+        errors.append(f"yf.download(actions=True): {type(ex).__name__}: {ex}")
+
+    for candidate in providers:
+        if candidate is not None and not candidate.empty:
+            return candidate
+
+    if errors:
+        logging.warning("No dividend data returned for %s between %s and %s. Provider errors: %s", t, s.date(), e.date(), " | ".join(errors))
+
+    return pd.Series(dtype=float, name=t)
 
 
 @st.cache_data(ttl=3600)
@@ -1651,18 +1715,36 @@ def compute_dividend_accrual_quarterly(
             .sort_values("quarter_end")
             .reset_index(drop=True)
         )
-        return {"total": float(ev_manual["div_cash"].sum()), "events": ev_manual, "quarterly": q_manual}
+        return {
+            "total": float(ev_manual["div_cash"].sum()),
+            "events": ev_manual,
+            "quarterly": q_manual,
+            "diagnostics": {"used_manual": True, "long_tickers_checked": [], "no_dividend_data_tickers": []},
+        }
 
     shares_df = compute_daily_shares_df(pname, meta, txns_all, baseline_all, end)
     if shares_df.empty or shares_df.shape[1] == 0:
-        return {"total": 0.0, "events": pd.DataFrame(), "quarterly": pd.DataFrame()}
+        return {
+            "total": 0.0,
+            "events": pd.DataFrame(),
+            "quarterly": pd.DataFrame(),
+            "diagnostics": {"used_manual": False, "long_tickers_checked": [], "no_dividend_data_tickers": []},
+        }
 
     tickers = list(shares_df.columns)
     events = []
+    long_tickers_checked = []
+    no_dividend_data_tickers = []
 
     for t in tickers:
+        max_long = float(np.nanmax(pd.to_numeric(shares_df[t], errors="coerce").fillna(0.0).values)) if t in shares_df.columns else 0.0
+        if max_long <= 1e-12:
+            continue
+        long_tickers_checked.append(t)
+
         div = fetch_dividends_series(t, start, end)
         if div is None or div.empty:
+            no_dividend_data_tickers.append(t)
             continue
 
         for d, v in div.items():
@@ -1687,7 +1769,16 @@ def compute_dividend_accrual_quarterly(
             )
 
     if not events:
-        return {"total": 0.0, "events": pd.DataFrame(), "quarterly": pd.DataFrame()}
+        return {
+            "total": 0.0,
+            "events": pd.DataFrame(),
+            "quarterly": pd.DataFrame(),
+            "diagnostics": {
+                "used_manual": False,
+                "long_tickers_checked": sorted(long_tickers_checked),
+                "no_dividend_data_tickers": sorted(no_dividend_data_tickers),
+            },
+        }
 
     ev = pd.DataFrame(events).sort_values(["div_date", "ticker"]).reset_index(drop=True)
     q = (
@@ -1697,7 +1788,16 @@ def compute_dividend_accrual_quarterly(
         .reset_index(drop=True)
     )
     total = float(ev["div_cash"].sum())
-    return {"total": total, "events": ev, "quarterly": q}
+    return {
+        "total": total,
+        "events": ev,
+        "quarterly": q,
+        "diagnostics": {
+            "used_manual": False,
+            "long_tickers_checked": sorted(long_tickers_checked),
+            "no_dividend_data_tickers": sorted(no_dividend_data_tickers),
+        },
+    }
 
 
 # =========================
@@ -2126,6 +2226,15 @@ def render_public_portfolio(
                 "No dividend events were matched for held LONG tickers in this analysis window. "
                 "If holdings were short-only, cash-only, or very recent, this can be expected."
             )
+            diag = divpack.get("diagnostics", {})
+            checked = diag.get("long_tickers_checked", []) if isinstance(diag, dict) else []
+            no_data = diag.get("no_dividend_data_tickers", []) if isinstance(diag, dict) else []
+            if checked and len(no_data) == len(checked):
+                st.warning(
+                    "Market dividend data was empty for all held LONG tickers in this window: "
+                    + ", ".join(no_data)
+                    + ". This usually means the upstream Yahoo endpoint returned no actions data."
+                )
         else:
             st.dataframe(divpack["quarterly"], use_container_width=True)
             st.bar_chart(divpack["quarterly"].set_index("quarter_end")[["div_cash"]])
