@@ -417,18 +417,17 @@ def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) 
     # Yahoo endpoints can intermittently return an empty `.dividends` series.
     # Try a few sources in priority order and use the first non-empty result.
     providers: list[pd.Series] = []
-    errors: list[str] = []
 
     try:
         providers.append(_normalize_dividends(yf.Ticker(t).dividends))
-    except Exception as ex:
-        errors.append(f"Ticker.dividends: {type(ex).__name__}: {ex}")
+    except Exception:
+        pass
 
     try:
         hist_actions = yf.Ticker(t).history(period="max", auto_adjust=False, actions=True)
         providers.append(_normalize_dividends(hist_actions))
-    except Exception as ex:
-        errors.append(f"Ticker.history(actions=True): {type(ex).__name__}: {ex}")
+    except Exception:
+        pass
 
     try:
         dl = yf.download(
@@ -447,15 +446,12 @@ def fetch_dividends_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) 
                 providers.append(_normalize_dividends(dl["Dividends"]))
         else:
             providers.append(_normalize_dividends(dl.get("Dividends")))
-    except Exception as ex:
-        errors.append(f"yf.download(actions=True): {type(ex).__name__}: {ex}")
+    except Exception:
+        pass
 
     for candidate in providers:
         if candidate is not None and not candidate.empty:
             return candidate
-
-    if errors:
-        logging.warning("No dividend data returned for %s between %s and %s. Provider errors: %s", t, s.date(), e.date(), " | ".join(errors))
 
     return pd.Series(dtype=float, name=t)
 
