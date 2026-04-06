@@ -2011,8 +2011,9 @@ def render_public_portfolio(
         )
     if divpack["quarterly"] is None or divpack["quarterly"].empty:
         st.info(
-            "Dividend tracker uses posted dividend transactions first; if none exist, "
-            "it falls back to market-estimated dividends based on LONG shares held on dividend dates."
+            "Dividend tracker only shows estimated cash when BOTH conditions are met: "
+            "(1) the portfolio had LONG shares on dividend dates, and "
+            "(2) the ticker has dividend events available from market data."
         )
 
     section_tabs = st.tabs(["Performance", "Attribution", "Income", "Risk", "Positions"])
@@ -2099,8 +2100,8 @@ def render_public_portfolio(
         st.markdown("### Dividend tracker (posted or estimated)")
         if divpack["quarterly"] is None or divpack["quarterly"].empty:
             st.info(
-                "No posted dividend transactions were found, and no market-estimated dividend events "
-                "matched held LONG positions in this analysis window."
+                "No dividend events were matched for held LONG tickers in this analysis window. "
+                "If holdings were short-only, cash-only, or very recent, this can be expected."
             )
         else:
             st.dataframe(divpack["quarterly"], use_container_width=True)
